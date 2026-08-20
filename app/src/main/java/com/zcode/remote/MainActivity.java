@@ -38,6 +38,7 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -50,10 +51,12 @@ import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
     private static final String KEY_URL = "url";
+    private static final String KEY_FAB_X = "fab_x";
+    private static final String KEY_FAB_Y = "fab_y";
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "1.4";
+    private static final String APP_VERSION = "1.5";
     private static final String RELEASE_API = "https://api.github.com/repos/LShang001/zcode-remote/releases/latest";
     private static final Pattern TAG_JSON = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9][0-9.]*)\"");
     private static final Pattern APK_URL_JSON = Pattern.compile("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.apk)\"");
@@ -194,6 +197,8 @@ public class MainActivity extends Activity {
         s.setDatabaseEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setTextZoom(100);
+        s.setUseWideViewPort(true);
+        s.setLoadWithOverviewMode(true);
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 
@@ -298,10 +303,19 @@ public class MainActivity extends Activity {
         container.addView(progress, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(3), Gravity.TOP));
         FrameLayout.LayoutParams fabLp = new FrameLayout.LayoutParams(
-                dp(44), dp(44), Gravity.BOTTOM | Gravity.END);
-        fabLp.rightMargin = dp(16);
-        fabLp.bottomMargin = dp(28);
-        container.addView(menuFab(), fabLp);
+                dp(44), dp(44), Gravity.TOP | Gravity.START);
+        SharedPreferences prefs = getPreferences(Context.MODE_PRIVATE);
+        fabLp.leftMargin = prefs.getInt(KEY_FAB_X, dp(16));
+        fabLp.topMargin = prefs.getInt(KEY_FAB_Y, dp(40));
+        TextView fab = menuFab();
+        container.addView(fab, fabLp);
+        container.post(() -> {
+            // 换设备/旋转后旧位置可能越界,布局完成时兜底拉回屏内
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) fab.getLayoutParams();
+            lp.leftMargin = clamp(lp.leftMargin, 0, Math.max(0, container.getWidth() - fab.getWidth()));
+            lp.topMargin = clamp(lp.topMargin, 0, Math.max(0, container.getHeight() - fab.getHeight()));
+            fab.setLayoutParams(lp);
+        });
 
         root.removeAllViews();
         root.addView(container, new FrameLayout.LayoutParams(
@@ -320,8 +334,56 @@ public class MainActivity extends Activity {
         bg.setColor(0xCC1B1F27);
         fab.setBackground(bg);
         fab.setElevation(dp(6));
-        fab.setOnClickListener(v -> showMenu());
+        // 点击=开菜单;按住拖动超过阈值=移动按钮并记住位置,避免挡住网页自己的按钮
+        fab.setOnTouchListener(new View.OnTouchListener() {
+            private float downX, downY;
+            private int startL, startT;
+            private boolean moved = false;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) v.getLayoutParams();
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downX = e.getRawX();
+                        downY = e.getRawY();
+                        startL = lp.leftMargin;
+                        startT = lp.topMargin;
+                        moved = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = e.getRawX() - downX;
+                        float dy = e.getRawY() - downY;
+                        if (!moved && dx * dx + dy * dy > dp(10) * dp(10)) {
+                            moved = true;
+                        }
+                        if (moved) {
+                            View parent = (View) v.getParent();
+                            lp.leftMargin = clamp((int) (startL + dx), 0, Math.max(0, parent.getWidth() - v.getWidth()));
+                            lp.topMargin = clamp((int) (startT + dy), 0, Math.max(0, parent.getHeight() - v.getHeight()));
+                            v.setLayoutParams(lp);
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        if (moved) {
+                            getPreferences(Context.MODE_PRIVATE).edit()
+                                    .putInt(KEY_FAB_X, lp.leftMargin)
+                                    .putInt(KEY_FAB_Y, lp.topMargin).apply();
+                            Toast.makeText(MainActivity.this, "按钮位置已保存", Toast.LENGTH_SHORT).show();
+                        } else if (e.getActionMasked() == MotionEvent.ACTION_UP) {
+                            showMenu();
+                        }
+                        return true;
+                }
+                return false;
+            }
+        });
         return fab;
+    }
+
+    private int clamp(int v, int lo, int hi) {
+        return Math.max(lo, Math.min(Math.max(hi, lo), v));
     }
 
     private void showMenu() {
@@ -330,7 +392,7 @@ public class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setTitle("ZCode Remote v" + APP_VERSION)
                 .setMessage("当前会话:\n" + shown
-                        + "\n\n链接失效了?在电脑上复制新链接,回到本 App 会自动切换。")
+                        + "\n\n链接失效了?在电脑上复制新链接,回到本 App 会自动切换。\n(长按拖动 ⋮ 按钮可移动位置)")
                 .setItems(new String[]{"刷新会话", "更换链接", "复制当前链接", "检查更新"}, (d, which) -> {
                     switch (which) {
                         case 0:
@@ -394,8 +456,7 @@ public class MainActivity extends Activity {
         change.setOnClickListener(v -> showSetup(url, null));
 
         root.removeAllViews();
-        root.addView(box, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(scrollWrap(box), contentLp());
     }
 
     private void showSetup(String prefill, String error) {
@@ -489,8 +550,26 @@ public class MainActivity extends Activity {
         box.addView(footer);
 
         root.removeAllViews();
-        root.addView(box, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(scrollWrap(box), contentLp());
+    }
+
+    /** 设置/错误页容器:竖屏占满,横屏与平板限宽居中,内容超高可滚动 */
+    private View scrollWrap(LinearLayout box) {
+        ScrollView sc = new ScrollView(this);
+        sc.setFillViewport(true);
+        sc.addView(box, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return sc;
+    }
+
+    private FrameLayout.LayoutParams contentLp() {
+        int maxW = dp(600);
+        if (getResources().getDisplayMetrics().widthPixels > maxW) {
+            return new FrameLayout.LayoutParams(maxW, ViewGroup.LayoutParams.MATCH_PARENT,
+                    Gravity.CENTER_HORIZONTAL);
+        }
+        return new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT);
     }
 
     private void stylePrimary(Button b) {
