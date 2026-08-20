@@ -11,11 +11,14 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
+import android.database.Cursor;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -56,7 +59,7 @@ public class MainActivity extends Activity {
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "1.5";
+    private static final String APP_VERSION = "1.6";
     private static final String RELEASE_API = "https://api.github.com/repos/LShang001/zcode-remote/releases/latest";
     private static final Pattern TAG_JSON = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9][0-9.]*)\"");
     private static final Pattern APK_URL_JSON = Pattern.compile("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.apk)\"");
@@ -77,6 +80,61 @@ public class MainActivity extends Activity {
     private String loadedUrl;
     private String lastAdoptedClip;
     private long pendingDownloadId = -1L;
+    private String pendingVersion;
+    private String pendingUrl;
+    private AlertDialog updateDialog;
+    private ProgressBar updateBar;
+    private TextView updateText;
+    private Handler updateHandler;
+    private final Runnable progressPoller = new Runnable() {
+        @Override
+        public void run() {
+            if (updateDialog == null || pendingDownloadId < 0) {
+                return;
+            }
+            DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            Cursor c = dm.query(new DownloadManager.Query().setFilterById(pendingDownloadId));
+            if (c == null) {
+                repost();
+                return;
+            }
+            try {
+                if (!c.moveToFirst()) {
+                    failDownload();
+                    return;
+                }
+                int status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                long done = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+                long total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                    long id = pendingDownloadId;
+                    pendingDownloadId = -1L;
+                    installApk(id);
+                    return;
+                }
+                if (status == DownloadManager.STATUS_FAILED) {
+                    failDownload();
+                    return;
+                }
+                if (updateText != null && updateBar != null) {
+                    int pct = total > 0 ? (int) (done * 100 / total) : 0;
+                    updateBar.setProgress(pct);
+                    String extra = status == DownloadManager.STATUS_PAUSED ? " · 等待网络…" : "";
+                    updateText.setText(pct + "% · " + formatSize(done) + " / "
+                            + (total > 0 ? formatSize(total) : "?") + extra);
+                }
+            } finally {
+                c.close();
+            }
+            repost();
+        }
+
+        private void repost() {
+            if (updateHandler != null) {
+                updateHandler.postDelayed(this, 400);
+            }
+        }
+    };
 
     private final BroadcastReceiver downloadDone = new BroadcastReceiver() {
         @Override
@@ -625,6 +683,9 @@ public class MainActivity extends Activity {
     }
 
     private void checkUpdate(final boolean manual) {
+        if (manual) {
+            toast("正在检查更新…");
+        }
         new Thread(() -> {
             String version = null;
             String apkUrl = null;
@@ -694,6 +755,8 @@ public class MainActivity extends Activity {
     }
 
     private void downloadUpdate(String version, String url) {
+        pendingVersion = version;
+        pendingUrl = url;
         try {
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
             req.setMimeType("application/vnd.android.package-archive");
@@ -701,17 +764,123 @@ public class MainActivity extends Activity {
             req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,
                     "ZCodeRemote-v" + version + ".apk");
             pendingDownloadId = ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(req);
-            toast("正在下载 v" + version + "…");
+            showDownloadProgress(version);
         } catch (Exception e) {
-            toast("下载失败,请稍后再试");
+            failDownload();
         }
     }
 
+    private void showDownloadProgress(String version) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24), dp(4), dp(24), 0);
+
+        updateText = new TextView(this);
+        updateText.setTextColor(FG_DIM);
+        updateText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        updateText.setText("准备下载…");
+        box.addView(updateText);
+
+        updateBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        updateBar.setMax(100);
+        updateBar.setProgressTintList(ColorStateList.valueOf(ACCENT));
+        LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        barLp.topMargin = dp(12);
+        box.addView(updateBar, barLp);
+
+        updateDialog = new AlertDialog.Builder(this)
+                .setTitle("正在下载 v" + version)
+                .setView(box)
+                .setCancelable(false)
+                .setPositiveButton("取消下载", (d, w) -> cancelDownload())
+                .show();
+        if (updateHandler == null) {
+            updateHandler = new Handler(Looper.getMainLooper());
+        }
+        updateHandler.removeCallbacks(progressPoller);
+        updateHandler.postDelayed(progressPoller, 400);
+    }
+
+    private void cancelDownload() {
+        if (pendingDownloadId >= 0) {
+            try {
+                ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).remove(pendingDownloadId);
+            } catch (Exception ignored) {
+            }
+            pendingDownloadId = -1L;
+        }
+        dismissUpdateDialog();
+        toast("已取消下载");
+    }
+
+    private void failDownload() {
+        String version = pendingVersion == null ? "" : pendingVersion;
+        if (pendingDownloadId >= 0) {
+            try {
+                ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).remove(pendingDownloadId);
+            } catch (Exception ignored) {
+            }
+            pendingDownloadId = -1L;
+        }
+        dismissUpdateDialog();
+        new AlertDialog.Builder(this)
+                .setTitle("下载失败")
+                .setMessage("新版本 v" + version + " 下载未完成,可能是网络波动。")
+                .setPositiveButton("重试", (d, w) -> {
+                    if (pendingUrl != null) {
+                        downloadUpdate(version, pendingUrl);
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void dismissUpdateDialog() {
+        if (updateHandler != null) {
+            updateHandler.removeCallbacks(progressPoller);
+        }
+        if (updateDialog != null && updateDialog.isShowing()) {
+            try {
+                updateDialog.dismiss();
+            } catch (Exception ignored) {
+            }
+        }
+        updateDialog = null;
+    }
+
+    private String formatSize(long b) {
+        if (b >= 1024 * 1024) {
+            return String.format("%.1f MB", b / 1048576.0);
+        }
+        if (b >= 1024) {
+            return (b / 1024) + " KB";
+        }
+        return b + " B";
+    }
+
     private void installApk(long downloadId) {
+        dismissUpdateDialog();
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("需要安装权限")
+                    .setMessage("安装更新前需允许本应用\"安装未知应用\"(只需授权一次)。\n\n授权后回到本 App,重新点\"检查更新\"即可继续完成安装。")
+                    .setPositiveButton("去授权", (d, w) -> {
+                        try {
+                            startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                    Uri.parse("package:" + getPackageName())));
+                        } catch (Exception e) {
+                            toast("无法打开授权设置");
+                        }
+                    })
+                    .setNegativeButton("以后再说", null)
+                    .show();
+            return;
+        }
         DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
         Uri uri = dm.getUriForDownloadedFile(downloadId);
         if (uri == null) {
-            toast("安装包下载失败");
+            failDownload();
             return;
         }
         Intent intent = new Intent(Intent.ACTION_VIEW);
@@ -760,6 +929,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        dismissUpdateDialog();
         unregisterReceiver(downloadDone);
         destroyWeb();
         super.onDestroy();
