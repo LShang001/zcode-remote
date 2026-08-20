@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="change_url"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/sc_change"
+        android:shortcutLongLabel="@string/sc_change_long">
+        <intent
+            android:action="com.zcode.remote.CHANGE_URL"
+            android:targetPackage="com.zcode.remote"
+            android:targetClass="com.zcode.remote.MainActivity" />
+    </shortcut>
+</shortcuts>

@@ -1,0 +1,12 @@
+# 构建缓存与产物
+.gradle/
+build/
+app/build/
+
+# 本机环境
+local.properties
+.idea/
+*.iml
+
+# 发版产物走 GitHub Releases 托管,不进 git
+ZCodeRemote.apk

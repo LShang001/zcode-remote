@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sc_change">更换链接</string>
+    <string name="sc_change_long">更换远程会话链接</string>
+</resources>
