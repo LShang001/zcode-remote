@@ -18,6 +18,13 @@ cp -f app/build/outputs/apk/debug/app-debug.apk ZCodeRemote.apk
 ```
 
 ```bash
+# 发 GitHub Release(App 自动更新的检查源,tag 必须 vX.Y 且 asset 为 .apk)
+git add -A && git commit -m "vX.Y: ..." && git push
+cp app/build/outputs/apk/debug/app-debug.apk /tmp/ZCodeRemote-vX.Y.apk
+gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更要点"
+```
+
+```bash
 # 启动模拟器做视觉审查(AVD 名 zc,已建好,WHPX 加速可用)
 "$LOCALAPPDATA/Android/Sdk/emulator/emulator.exe" -avd zc -no-snapshot-save -no-boot-anim -gpu swiftshader_indirect &
 ```
@@ -35,7 +42,7 @@ cp -f app/build/outputs/apk/debug/app-debug.apk ZCodeRemote.apk
 
 1. **壳的本分** — 网页内的功能与 UI 归 ZCode 官方;壳只做装载、链接管理和移动体验,增强走系统能力(下载管理、外链跳浏览器),保持不注入 CSS/JS 改网页(会随网页更新碎掉)
 2. **单文件极简** — 逻辑收进 MainActivity.java,UI 用代码构建,保持零第三方依赖;每加一个依赖先问能不能不加
-3. **发版三同步** — `versionCode` +1、`versionName`、设置页 footer 版本文本,一次发版三处同改
+3. **发版四同步** — `versionCode` +1、`versionName`、设置页 footer 版本(常量 `APP_VERSION`)、GitHub Release(tag `vX.Y` + 上传 APK),一次发版四处同改;漏发 Release 等于用户永远收不到更新
 4. **眼见为实** — 改 UI 后在模拟器跑起来截图,用 Read 亲眼看图确认才算完成
 
 ## 边界
@@ -54,6 +61,8 @@ cp -f app/build/outputs/apk/debug/app-debug.apk ZCodeRemote.apk
 - 中文项目路径触发 AGP "non-ASCII characters" 报错 — 保留 `gradle.properties` 里的 `android.overridePathCheck=true`(来源:2026-08-21 迁移 D 盘实测)
 - 远程链接每次新会话都变 — 链接只从剪贴板 / VIEW intent / 设置页动态获取,代码里仅维护正则 `https://zcode\.z\.ai/remote\S*`;硬编码 sid 等于写死一个注定过期的会话(来源:v1.0 设计验证)
 - 远程网页是 SPA 内部滚动,`webView.getScrollY()` 恒为 0,不能作为下拉刷新"已在顶部"的判据,否则页内任何下拉都误触刷新重连 — 改用手势起点在屏幕顶部窄条(downY < 高度/6)+ 近乎垂直 + 拉够深三重判定(来源:2026-08-21 v1.2 修复实测)
+- targetSdk 34 上动态注册非豁免广播(含 `ACTION_DOWNLOAD_COMPLETE`)必须显式传 `RECEIVER_NOT_EXPORTED`,否则启动即 SecurityException 崩溃;系统服务发出的广播不受 NOT_EXPORTED 影响(来源:2026-08-21 v1.3 模拟器实测)
+- GitHub Releases API 匿名请求有约 1 分钟 CDN 缓存 — 刚发完 Release 立刻在 App 里"检查更新"可能拿到旧 latest,稍等重试即可,不是代码 bug(来源:2026-08-21 v1.3 更新链路实测)
 - adb 预置 `shared_prefs/MainActivity.xml` 时 URL 里的 `&` 要写成 `&amp;`,否则链接被 XML 截断(来源:模拟器测试实测)
 
 ## 知识沉淀协议
