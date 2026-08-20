@@ -63,6 +63,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - 远程网页是 SPA 内部滚动,`webView.getScrollY()` 恒为 0,不能作为下拉刷新"已在顶部"的判据,否则页内任何下拉都误触刷新重连 — 改用手势起点在屏幕顶部窄条(downY < 高度/6)+ 近乎垂直 + 拉够深三重判定(来源:2026-08-21 v1.2 修复实测)
 - targetSdk 34 上动态注册非豁免广播(含 `ACTION_DOWNLOAD_COMPLETE`)必须显式传 `RECEIVER_NOT_EXPORTED`,否则启动即 SecurityException 崩溃;系统服务发出的广播不受 NOT_EXPORTED 影响(来源:2026-08-21 v1.3 模拟器实测)
 - GitHub Releases API 匿名请求有约 1 分钟 CDN 缓存 — 刚发完 Release 立刻在 App 里"检查更新"可能拿到旧 latest,稍等重试即可,不是代码 bug(来源:2026-08-21 v1.3 更新链路实测)
+- GitHub asset 真实下载走 `objects.githubusercontent.com`,本机网络对它时通时断 — App 里 API 检查成功但 DownloadManager 永远 0 字节时,先怀疑该域被阻断(宿主 `curl -sIL <asset URL>` 可对照);模拟器验证安装链路可用 root 改 downloads.db 把条目置 status=200 并指向 push 进去的 APK(来源:2026-08-21 v1.6 实测)
+- 模拟器 `emu network speed` 限速命令会弄丢 guest 默认路由(ip route 无 default),且重启/wipe 前难恢复 — 测完限速记得恢复;真要限速测下载,优先在真机或抓中间态截图为主(来源:2026-08-21 v1.6 实测)
 - adb 预置 `shared_prefs/MainActivity.xml` 时 URL 里的 `&` 要写成 `&amp;`,否则链接被 XML 截断(来源:模拟器测试实测)
 
 ## 知识沉淀协议
