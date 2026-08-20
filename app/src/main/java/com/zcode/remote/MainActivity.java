@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -52,7 +53,7 @@ public class MainActivity extends Activity {
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "1.3";
+    private static final String APP_VERSION = "1.4";
     private static final String RELEASE_API = "https://api.github.com/repos/LShang001/zcode-remote/releases/latest";
     private static final Pattern TAG_JSON = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9][0-9.]*)\"");
     private static final Pattern APK_URL_JSON = Pattern.compile("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.apk)\"");
@@ -296,11 +297,65 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         container.addView(progress, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(3), Gravity.TOP));
+        FrameLayout.LayoutParams fabLp = new FrameLayout.LayoutParams(
+                dp(44), dp(44), Gravity.BOTTOM | Gravity.END);
+        fabLp.rightMargin = dp(16);
+        fabLp.bottomMargin = dp(28);
+        container.addView(menuFab(), fabLp);
 
         root.removeAllViews();
         root.addView(container, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         webView.loadUrl(url);
+    }
+
+    private TextView menuFab() {
+        TextView fab = new TextView(this);
+        fab.setText("⋮");
+        fab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        fab.setTextColor(FG);
+        fab.setGravity(Gravity.CENTER);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(0xCC1B1F27);
+        fab.setBackground(bg);
+        fab.setElevation(dp(6));
+        fab.setOnClickListener(v -> showMenu());
+        return fab;
+    }
+
+    private void showMenu() {
+        final String url = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, "");
+        String shown = url.length() > 46 ? url.substring(0, 43) + "…" : url;
+        new AlertDialog.Builder(this)
+                .setTitle("ZCode Remote v" + APP_VERSION)
+                .setMessage("当前会话:\n" + shown
+                        + "\n\n链接失效了?在电脑上复制新链接,回到本 App 会自动切换。")
+                .setItems(new String[]{"刷新会话", "更换链接", "复制当前链接", "检查更新"}, (d, which) -> {
+                    switch (which) {
+                        case 0:
+                            if (webView != null) {
+                                webView.reload();
+                            }
+                            break;
+                        case 1:
+                            showSetup(url, null);
+                            break;
+                        case 2:
+                            try {
+                                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                                cm.setPrimaryClip(ClipData.newPlainText("url", url));
+                                Toast.makeText(this, "已复制当前链接", Toast.LENGTH_SHORT).show();
+                            } catch (Exception ignored) {
+                            }
+                            break;
+                        case 3:
+                            checkUpdate(true);
+                            break;
+                    }
+                })
+                .setNegativeButton("关闭", null)
+                .show();
     }
 
     private void showError(String message) {
