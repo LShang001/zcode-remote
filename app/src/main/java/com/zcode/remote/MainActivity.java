@@ -1,11 +1,14 @@
 package com.zcode.remote;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.net.Uri;
@@ -36,6 +39,10 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -43,6 +50,11 @@ public class MainActivity extends Activity {
     private static final String KEY_URL = "url";
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
+    // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
+    private static final String APP_VERSION = "1.3";
+    private static final String RELEASE_API = "https://api.github.com/repos/LShang001/zcode-remote/releases/latest";
+    private static final Pattern TAG_JSON = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9][0-9.]*)\"");
+    private static final Pattern APK_URL_JSON = Pattern.compile("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.apk)\"");
     private static final int BG = 0xFF0F1014;
     private static final int FG = 0xFFEDEEF0;
     private static final int FG_DIM = 0xFF9AA0A6;
@@ -59,16 +71,30 @@ public class MainActivity extends Activity {
     private String allowedHost;
     private String loadedUrl;
     private String lastAdoptedClip;
+    private long pendingDownloadId = -1L;
+
+    private final BroadcastReceiver downloadDone = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
+            if (id == pendingDownloadId) {
+                pendingDownloadId = -1L;
+                installApk(id);
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         WebView.setWebContentsDebuggingEnabled(true);
+        registerReceiver(downloadDone, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
         root = new FrameLayout(this);
         root.setBackgroundColor(BG);
         setContentView(root);
         route(getIntent());
+        checkUpdate(false);
     }
 
     @Override
@@ -387,8 +413,14 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "已粘贴,确认后点「保存并打开」", Toast.LENGTH_SHORT).show();
         });
 
+        Button check = new Button(this);
+        check.setText("检查更新");
+        styleSecondary(check);
+        box.addView(check, buttonLp());
+        check.setOnClickListener(v -> checkUpdate(true));
+
         TextView footer = new TextView(this);
-        footer.setText("v1.2 · ZCode 网页的独立窗口封装");
+        footer.setText("v" + APP_VERSION + " · ZCode 网页的独立窗口封装");
         footer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         footer.setTextColor(FG_DIM);
         footer.setPadding(0, dp(28), 0, 0);
@@ -451,6 +483,110 @@ public class MainActivity extends Activity {
         return m.find() ? m.group() : null;
     }
 
+    private void checkUpdate(final boolean manual) {
+        new Thread(() -> {
+            String version = null;
+            String apkUrl = null;
+            try {
+                HttpURLConnection conn = (HttpURLConnection) new URL(RELEASE_API).openConnection();
+                conn.setRequestProperty("Accept", "application/vnd.github+json");
+                conn.setConnectTimeout(10000);
+                conn.setReadTimeout(10000);
+                if (conn.getResponseCode() == 200) {
+                    String body = readAll(conn.getInputStream());
+                    conn.disconnect();
+                    Matcher tag = TAG_JSON.matcher(body);
+                    Matcher apk = APK_URL_JSON.matcher(body);
+                    if (tag.find() && apk.find()) {
+                        version = tag.group(1);
+                        apkUrl = apk.group(1);
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            final String v = version;
+            final String url = apkUrl;
+            runOnUiThread(() -> {
+                if (v != null && url != null && versionNewer(v, APP_VERSION)) {
+                    offerUpdate(v, url);
+                } else if (manual) {
+                    toast(v == null ? "检查更新失败,请稍后再试" : "已是最新版本 v" + APP_VERSION);
+                }
+            });
+        }).start();
+    }
+
+    private boolean versionNewer(String remote, String local) {
+        try {
+            String[] a = remote.split("\\.");
+            String[] b = local.split("\\.");
+            for (int i = 0; i < Math.max(a.length, b.length); i++) {
+                int x = i < a.length ? Integer.parseInt(a[i]) : 0;
+                int y = i < b.length ? Integer.parseInt(b[i]) : 0;
+                if (x != y) {
+                    return x > y;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    private String readAll(java.io.InputStream in) throws Exception {
+        BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = r.readLine()) != null) {
+            sb.append(line);
+        }
+        r.close();
+        return sb.toString();
+    }
+
+    private void offerUpdate(final String version, final String url) {
+        new AlertDialog.Builder(this)
+                .setTitle("发现新版本 v" + version)
+                .setMessage("建议更新以获得最新修复。\n\n下载完成后会自动弹出安装界面,首次安装需允许本应用\"安装未知应用\"。")
+                .setPositiveButton("立即更新", (d, w) -> downloadUpdate(version, url))
+                .setNegativeButton("暂不", null)
+                .show();
+    }
+
+    private void downloadUpdate(String version, String url) {
+        try {
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+            req.setMimeType("application/vnd.android.package-archive");
+            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,
+                    "ZCodeRemote-v" + version + ".apk");
+            pendingDownloadId = ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(req);
+            toast("正在下载 v" + version + "…");
+        } catch (Exception e) {
+            toast("下载失败,请稍后再试");
+        }
+    }
+
+    private void installApk(long downloadId) {
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        Uri uri = dm.getUriForDownloadedFile(downloadId);
+        if (uri == null) {
+            toast("安装包下载失败");
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(uri, "application/vnd.android.package-archive");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(intent);
+        } catch (Exception e) {
+            toast("无法启动安装界面");
+        }
+    }
+
+    private void toast(String msg) {
+        runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show());
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
@@ -483,6 +619,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        unregisterReceiver(downloadDone);
         destroyWeb();
         super.onDestroy();
     }
