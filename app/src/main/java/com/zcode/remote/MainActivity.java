@@ -42,6 +42,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -56,10 +57,12 @@ public class MainActivity extends Activity {
     private static final String KEY_URL = "url";
     private static final String KEY_FAB_X = "fab_x";
     private static final String KEY_FAB_Y = "fab_y";
+    private static final String KEY_SHOW_FAB = "show_fab";
+    private static final String KEY_AUTO_UPDATE = "auto_update";
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "1.6";
+    private static final String APP_VERSION = "1.7";
     private static final String RELEASE_API = "https://api.github.com/repos/LShang001/zcode-remote/releases/latest";
     private static final Pattern TAG_JSON = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9][0-9.]*)\"");
     private static final Pattern APK_URL_JSON = Pattern.compile("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.apk)\"");
@@ -86,6 +89,8 @@ public class MainActivity extends Activity {
     private ProgressBar updateBar;
     private TextView updateText;
     private Handler updateHandler;
+    private TextView fab;
+    private AlertDialog menuDialog;
     private final Runnable progressPoller = new Runnable() {
         @Override
         public void run() {
@@ -163,7 +168,9 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(BG);
         setContentView(root);
         route(getIntent());
-        checkUpdate(false);
+        if (getPreferences(Context.MODE_PRIVATE).getBoolean(KEY_AUTO_UPDATE, true)) {
+            checkUpdate(false);
+        }
     }
 
     @Override
@@ -365,7 +372,8 @@ public class MainActivity extends Activity {
         SharedPreferences prefs = getPreferences(Context.MODE_PRIVATE);
         fabLp.leftMargin = prefs.getInt(KEY_FAB_X, dp(16));
         fabLp.topMargin = prefs.getInt(KEY_FAB_Y, dp(40));
-        TextView fab = menuFab();
+        fab = menuFab();
+        fab.setVisibility(prefs.getBoolean(KEY_SHOW_FAB, true) ? View.VISIBLE : View.GONE);
         container.addView(fab, fabLp);
         container.post(() -> {
             // 换设备/旋转后旧位置可能越界,布局完成时兜底拉回屏内
@@ -446,35 +454,193 @@ public class MainActivity extends Activity {
 
     private void showMenu() {
         final String url = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, "");
-        String shown = url.length() > 46 ? url.substring(0, 43) + "…" : url;
-        new AlertDialog.Builder(this)
-                .setTitle("ZCode Remote v" + APP_VERSION)
-                .setMessage("当前会话:\n" + shown
-                        + "\n\n链接失效了?在电脑上复制新链接,回到本 App 会自动切换。\n(长按拖动 ⋮ 按钮可移动位置)")
-                .setItems(new String[]{"刷新会话", "更换链接", "复制当前链接", "检查更新"}, (d, which) -> {
-                    switch (which) {
-                        case 0:
-                            if (webView != null) {
-                                webView.reload();
-                            }
-                            break;
-                        case 1:
-                            showSetup(url, null);
-                            break;
-                        case 2:
-                            try {
-                                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                                cm.setPrimaryClip(ClipData.newPlainText("url", url));
-                                Toast.makeText(this, "已复制当前链接", Toast.LENGTH_SHORT).show();
-                            } catch (Exception ignored) {
-                            }
-                            break;
-                        case 3:
-                            checkUpdate(true);
-                            break;
-                    }
-                })
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+
+        TextView title = new TextView(this);
+        title.setText("ZCode Remote · v" + APP_VERSION);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        title.setTextColor(FG);
+        title.setPadding(0, 0, 0, dp(4));
+        box.addView(title);
+
+        TextView session = new TextView(this);
+        session.setText("当前会话:" + (url.isEmpty() ? "(未设置)" : url));
+        session.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        session.setTextColor(FG_DIM);
+        session.setPadding(0, 0, 0, dp(8));
+        box.addView(session);
+
+        box.addView(panelRow("⟳", "刷新会话", "重新加载当前会话页面", v -> {
+            dismissMenu();
+            if (webView != null) {
+                webView.reload();
+            }
+        }));
+        box.addView(panelRow("✎", "更换链接", "回到设置页,粘贴新的远程链接", v -> {
+            dismissMenu();
+            showSetup(url, null);
+        }));
+        box.addView(panelRow("⧉", "复制当前链接", "把会话链接复制到剪贴板", v -> {
+            try {
+                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(ClipData.newPlainText("url", url));
+                Toast.makeText(this, "已复制当前链接", Toast.LENGTH_SHORT).show();
+            } catch (Exception ignored) {
+            }
+        }));
+        box.addView(panelRow("⬇", "检查更新", "查看 GitHub 上是否有新版本", v -> checkUpdate(true)));
+
+        box.addView(panelHeader("设置"));
+        box.addView(panelSwitch("悬浮按钮", "显示会话页的 ⋮ 菜单按钮", KEY_SHOW_FAB, (c) -> {
+            if (fab != null) {
+                fab.setVisibility(c ? View.VISIBLE : View.GONE);
+            }
+            Toast.makeText(this, c ? "悬浮按钮已开启"
+                    : "已隐藏,从设置页可再开启", Toast.LENGTH_SHORT).show();
+        }));
+        box.addView(panelSwitch("启动时自动检查更新", "打开 App 时在后台静默检查", KEY_AUTO_UPDATE, (c) -> {
+        }));
+
+        box.addView(panelHeader("工具"));
+        box.addView(panelRow("✕", "清除网页数据", "解决网页卡死或状态错乱(清 Cookie/缓存)", v -> confirmClearData()));
+        box.addView(panelRow("ⓘ", "关于本应用", "版本信息与使用说明", v -> showAbout(url)));
+
+        TextView footer = new TextView(this);
+        footer.setText("ZCode Remote v" + APP_VERSION + " · 网页的独立窗口封装");
+        footer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        footer.setTextColor(FG_DIM);
+        footer.setGravity(Gravity.CENTER_HORIZONTAL);
+        footer.setPadding(0, dp(14), 0, 0);
+        box.addView(footer);
+
+        ScrollView sc = new ScrollView(this);
+        sc.addView(box);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setPadding(dp(24), dp(20), dp(24), dp(16));
+        wrap.addView(sc);
+
+        menuDialog = new AlertDialog.Builder(this)
+                .setView(wrap)
                 .setNegativeButton("关闭", null)
+                .show();
+    }
+
+    private void dismissMenu() {
+        if (menuDialog != null && menuDialog.isShowing()) {
+            try {
+                menuDialog.dismiss();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private View panelRow(String icon, String title, String sub, View.OnClickListener action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(10), 0, dp(10));
+        row.setOnClickListener(action);
+
+        TextView ic = new TextView(this);
+        ic.setText(icon);
+        ic.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        ic.setTextColor(ACCENT);
+        ic.setWidth(dp(34));
+        ic.setGravity(Gravity.CENTER);
+        row.addView(ic);
+
+        LinearLayout txt = new LinearLayout(this);
+        txt.setOrientation(LinearLayout.VERTICAL);
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        t.setTextColor(FG);
+        txt.addView(t);
+        if (sub != null) {
+            TextView s = new TextView(this);
+            s.setText(sub);
+            s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            s.setTextColor(FG_DIM);
+            txt.addView(s);
+        }
+        row.addView(txt, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        return row;
+    }
+
+    private TextView panelHeader(String text) {
+        TextView h = new TextView(this);
+        h.setText(text);
+        h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        h.setTextColor(ACCENT);
+        h.setPadding(0, dp(14), 0, dp(2));
+        return h;
+    }
+
+    private interface SwitchChanged {
+        void onChanged(boolean checked);
+    }
+
+    private View panelSwitch(String title, String sub, String prefKey, SwitchChanged onChanged) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(8), 0, dp(8));
+
+        LinearLayout txt = new LinearLayout(this);
+        txt.setOrientation(LinearLayout.VERTICAL);
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        t.setTextColor(FG);
+        txt.addView(t);
+        if (sub != null) {
+            TextView s = new TextView(this);
+            s.setText(sub);
+            s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            s.setTextColor(FG_DIM);
+            txt.addView(s);
+        }
+        row.addView(txt, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+
+        Switch sw = new Switch(this);
+        sw.setChecked(getPreferences(Context.MODE_PRIVATE).getBoolean(prefKey, true));
+        sw.setOnCheckedChangeListener((v, c) -> {
+            getPreferences(Context.MODE_PRIVATE).edit().putBoolean(prefKey, c).apply();
+            onChanged.onChanged(c);
+        });
+        row.addView(sw);
+        return row;
+    }
+
+    private void confirmClearData() {
+        new AlertDialog.Builder(this)
+                .setTitle("清除网页数据")
+                .setMessage("会删除网页的 Cookie、缓存和本地存储。\n\n用于网页卡死、状态错乱时强制重置;不影响已保存的远程链接。确定继续吗?")
+                .setPositiveButton("清除并刷新", (d, w) -> {
+                    dismissMenu();
+                    CookieManager.getInstance().removeAllCookies(null);
+                    if (webView != null) {
+                        webView.clearCache(true);
+                        webView.clearFormData();
+                        webView.reload();
+                    }
+                    Toast.makeText(this, "网页数据已清除,正在刷新", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void showAbout(String url) {
+        new AlertDialog.Builder(this)
+                .setTitle("关于 ZCode Remote")
+                .setMessage("版本:v" + APP_VERSION
+                        + "\n\n当前会话:\n" + (url.isEmpty() ? "(未设置)" : url)
+                        + "\n\n说明:\n把 ZCode 桌面端的远程控制网页封装成独立 App,只做装载与移动体验增强,网页功能归 ZCode 官方。")
+                .setPositiveButton("关闭", null)
                 .show();
     }
 
@@ -599,6 +765,15 @@ public class MainActivity extends Activity {
         styleSecondary(check);
         box.addView(check, buttonLp());
         check.setOnClickListener(v -> checkUpdate(true));
+
+        final String savedUrl = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
+        if (savedUrl != null) {
+            Button back = new Button(this);
+            back.setText("返回会话");
+            styleSecondary(back);
+            box.addView(back, buttonLp());
+            back.setOnClickListener(v -> showWeb(savedUrl));
+        }
 
         TextView footer = new TextView(this);
         footer.setText("v" + APP_VERSION + " · ZCode 网页的独立窗口封装");
@@ -930,6 +1105,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         dismissUpdateDialog();
+        dismissMenu();
         unregisterReceiver(downloadDone);
         destroyWeb();
         super.onDestroy();
