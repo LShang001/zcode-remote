@@ -52,6 +52,25 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.ValueAnimator;
+import android.view.animation.DecelerateInterpolator;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.util.ArrayList;
+import java.util.List;
+
+import android.Manifest;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.webkit.WebStorage;
+import android.webkit.WebViewDatabase;
+
 
 public class MainActivity extends Activity {
     private static final String KEY_URL = "url";
@@ -62,7 +81,12 @@ public class MainActivity extends Activity {
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "1.7";
+    private static final String APP_VERSION = "1.9";
+    static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
+    private static final String KEY_HISTORY = "history_urls";
+    private static final int MAX_HISTORY = 8;
+    private static final String KEY_LAST_UPDATE_CHECK = "last_update_check";
+    private static final long UPDATE_CHECK_INTERVAL_MS = 4L * 60L * 60L * 1000L; // 自动检查节流:4 小时
     private static final String RELEASE_API = "https://api.github.com/repos/LShang001/zcode-remote/releases/latest";
     private static final Pattern TAG_JSON = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9][0-9.]*)\"");
     private static final Pattern APK_URL_JSON = Pattern.compile("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.apk)\"");
@@ -74,6 +98,8 @@ public class MainActivity extends Activity {
     private static final int BTN_PRIMARY = 0xFF1B5BD7;
     private static final int BTN_SECONDARY = 0xFF2A2D36;
     private static final int REQ_FILE = 1;
+    private static final int REQ_SCAN = 2;
+    private static final int REQ_NOTIF = 3;
 
     private FrameLayout root;
     private WebView webView;
@@ -91,6 +117,9 @@ public class MainActivity extends Activity {
     private Handler updateHandler;
     private TextView fab;
     private AlertDialog menuDialog;
+    private long lastBackTime = 0L;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private boolean onErrorPage = false;
     private final Runnable progressPoller = new Runnable() {
         @Override
         public void run() {
@@ -155,8 +184,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        WebView.setWebContentsDebuggingEnabled(true);
+        applyKeepScreenOn(getPreferences(Context.MODE_PRIVATE).getBoolean(KEY_KEEP_SCREEN_ON, true));
+        // 只在 debug 包里开启 WebView 远程调试,release 关闭减少调试口暴露
+        boolean debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        WebView.setWebContentsDebuggingEnabled(debuggable);
         // targetSdk 34 要求动态注册非豁免系统广播时显式声明导出标志;系统服务(DownloadManager)不受 NOT_EXPORTED 影响
         IntentFilter doneFilter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
         if (Build.VERSION.SDK_INT >= 33) {
@@ -164,12 +195,55 @@ public class MainActivity extends Activity {
         } else {
             registerReceiver(downloadDone, doneFilter);
         }
+        registerNetworkCallback();
+        maybeRequestNotificationPermission();
         root = new FrameLayout(this);
         root.setBackgroundColor(BG);
         setContentView(root);
         route(getIntent());
-        if (getPreferences(Context.MODE_PRIVATE).getBoolean(KEY_AUTO_UPDATE, true)) {
+        SharedPreferences sp = getPreferences(Context.MODE_PRIVATE);
+        // 自动检查节流:距上次检查不足 4 小时则跳过,避免每次冷启动都打 GitHub API
+        if (sp.getBoolean(KEY_AUTO_UPDATE, true)
+                && System.currentTimeMillis() - sp.getLong(KEY_LAST_UPDATE_CHECK, 0L) >= UPDATE_CHECK_INTERVAL_MS) {
             checkUpdate(false);
+        }
+    }
+
+    /** Android 13+ 下载/更新通知需要运行时申请 POST_NOTIFICATIONS,否则通知静默不显示 */
+    private void maybeRequestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            try {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIF);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** 监听网络:从断网恢复时,若正停在错误页则自动重连(弱网/切 Wi-Fi 场景免手动重试) */
+    private void registerNetworkCallback() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return;
+            }
+            networkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    runOnUiThread(() -> {
+                        if (onErrorPage) {
+                            String url = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
+                            if (url != null) {
+                                Toast.makeText(MainActivity.this, "网络已恢复,正在重连…", Toast.LENGTH_SHORT).show();
+                                showWeb(url);
+                            }
+                        }
+                    });
+                }
+            };
+            cm.registerNetworkCallback(new NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback);
+        } catch (Exception ignored) {
         }
     }
 
@@ -209,6 +283,7 @@ public class MainActivity extends Activity {
             }
             if (shared != null && REMOTE_URL.matcher(shared).matches()) {
                 prefs.edit().putString(KEY_URL, shared).apply();
+                recordHistory(shared);
                 showWeb(shared);
                 return;
             }
@@ -228,6 +303,220 @@ public class MainActivity extends Activity {
         }
     }
 
+
+    private void applyKeepScreenOn(boolean keepOn) {
+        if (keepOn) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+    }
+
+    private static class HistoryItem {
+        final String url;
+        final long time;
+        HistoryItem(String url, long time) {
+            this.url = url;
+            this.time = time;
+        }
+    }
+
+    private List<HistoryItem> getHistoryList() {
+        List<HistoryItem> list = new ArrayList<>();
+        String jsonStr = getPreferences(Context.MODE_PRIVATE).getString(KEY_HISTORY, "[]");
+        try {
+            JSONArray arr = new JSONArray(jsonStr);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject obj = arr.getJSONObject(i);
+                list.add(new HistoryItem(obj.optString("url"), obj.optLong("time")));
+            }
+        } catch (Exception ignored) {
+        }
+        return list;
+    }
+
+    private void recordHistory(String url) {
+        if (url == null || url.trim().isEmpty()) {
+            return;
+        }
+        List<HistoryItem> list = getHistoryList();
+        List<HistoryItem> updated = new ArrayList<>();
+        updated.add(new HistoryItem(url, System.currentTimeMillis()));
+        for (HistoryItem item : list) {
+            if (!item.url.equals(url)) {
+                updated.add(item);
+            }
+            if (updated.size() >= MAX_HISTORY) {
+                break;
+            }
+        }
+        JSONArray arr = new JSONArray();
+        for (HistoryItem item : updated) {
+            try {
+                JSONObject obj = new JSONObject();
+                obj.put("url", item.url);
+                obj.put("time", item.time);
+                arr.put(obj);
+            } catch (Exception ignored) {
+            }
+        }
+        getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_HISTORY, arr.toString()).apply();
+    }
+
+    private void clearHistory() {
+        getPreferences(Context.MODE_PRIVATE).edit().remove(KEY_HISTORY).apply();
+    }
+
+    /** 删除单条历史;若删的是当前会话,不改变当前加载,仅从列表移除 */
+    private void removeHistoryItem(String url) {
+        List<HistoryItem> list = getHistoryList();
+        JSONArray arr = new JSONArray();
+        for (HistoryItem item : list) {
+            if (item.url.equals(url)) {
+                continue;
+            }
+            try {
+                JSONObject obj = new JSONObject();
+                obj.put("url", item.url);
+                obj.put("time", item.time);
+                arr.put(obj);
+            } catch (Exception ignored) {
+            }
+        }
+        getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_HISTORY, arr.toString()).apply();
+    }
+
+    private String formatRelativeTime(long time) {
+        long diff = System.currentTimeMillis() - time;
+        if (diff < 60_000L) {
+            return "刚刚";
+        } else if (diff < 3600_000L) {
+            return (diff / 60_000L) + " 分钟前";
+        } else if (diff < 86400_000L) {
+            return (diff / 3600_000L) + " 小时前";
+        } else {
+            return (diff / 86400_000L) + " 天前";
+        }
+    }
+
+    private String summarizeUrl(String url) {
+        try {
+            Uri uri = Uri.parse(url);
+            String sid = uri.getQueryParameter("sid");
+            if (sid != null && !sid.isEmpty()) {
+                String sub = sid.length() > 8 ? sid.substring(0, 8) + "…" : sid;
+                return "会话 sid: " + sub;
+            }
+            String path = uri.getPath();
+            if (path != null && !path.isEmpty()) {
+                return path;
+            }
+        } catch (Exception ignored) {
+        }
+        return "远程会话";
+    }
+
+    private void showHistoryDialog() {
+        final List<HistoryItem> list = getHistoryList();
+        if (list.isEmpty()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("历史会话")
+                    .setMessage("暂无历史会话记录。\n\n当你使用新链接连接后，会自动记录在此处，方便日后切换。")
+                    .setPositiveButton("知道了", null)
+                    .show();
+            return;
+        }
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(16);
+        box.setPadding(pad, pad, pad, pad);
+
+        TextView head = new TextView(this);
+        head.setText("最近使用的会话（最多保存 " + MAX_HISTORY + " 条）");
+        head.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        head.setTextColor(FG_DIM);
+        head.setPadding(0, 0, 0, dp(12));
+        box.addView(head);
+
+        final AlertDialog[] dialogHolder = new AlertDialog[1];
+
+        for (final HistoryItem item : list) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            row.setClickable(true);
+            row.setFocusable(true);
+
+            GradientDrawable rowBg = new GradientDrawable();
+            rowBg.setColor(0xFF16181F);
+            rowBg.setCornerRadius(dp(6));
+            row.setBackground(rowBg);
+
+            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rowLp.bottomMargin = dp(8);
+
+            TextView titleView = new TextView(this);
+            titleView.setText(summarizeUrl(item.url) + "  ·  " + formatRelativeTime(item.time));
+            titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            titleView.setTextColor(ACCENT);
+            row.addView(titleView);
+
+            TextView urlView = new TextView(this);
+            urlView.setText(item.url);
+            urlView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            urlView.setTextColor(FG_DIM);
+            urlView.setSingleLine(true);
+            urlView.setPadding(0, dp(4), 0, 0);
+            row.addView(urlView);
+
+            row.setOnClickListener(v -> {
+                if (dialogHolder[0] != null) {
+                    dialogHolder[0].dismiss();
+                }
+                dismissMenu();
+                getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_URL, item.url).apply();
+                recordHistory(item.url);
+                showWeb(item.url);
+                toast("已切换到选中的历史会话");
+            });
+
+            // 长按单条:仅删除这条历史(不影响当前会话),避免只能一键清空
+            row.setOnLongClickListener(v -> {
+                new AlertDialog.Builder(this)
+                        .setTitle("删除这条历史会话")
+                        .setMessage(summarizeUrl(item.url) + "\n\n仅从历史列表移除,不会影响当前打开的会话。")
+                        .setPositiveButton("删除", (d, w) -> {
+                            removeHistoryItem(item.url);
+                            if (dialogHolder[0] != null) {
+                                dialogHolder[0].dismiss();
+                            }
+                            toast("已删除该条历史");
+                            showHistoryDialog();
+                        })
+                        .setNegativeButton("取消", null)
+                        .show();
+                return true;
+            });
+
+            box.addView(row, rowLp);
+        }
+
+        ScrollView sc = new ScrollView(this);
+        sc.addView(box);
+
+        dialogHolder[0] = new AlertDialog.Builder(this)
+                .setTitle("历史会话")
+                .setView(sc)
+                .setPositiveButton("清空历史", (d, w) -> {
+                    clearHistory();
+                    toast("历史记录已清空");
+                })
+                .setNegativeButton("关闭", null)
+                .show();
+    }
+
     private boolean switchToClipboardUrl() {
         SharedPreferences prefs = getPreferences(Context.MODE_PRIVATE);
         String saved = prefs.getString(KEY_URL, null);
@@ -236,6 +525,7 @@ public class MainActivity extends Activity {
         if (clip != null && !clip.equals(saved) && !clip.equals(lastAdoptedClip)) {
             lastAdoptedClip = clip;
             prefs.edit().putString(KEY_URL, clip).apply();
+            recordHistory(clip);
             Toast.makeText(this, "已识别剪贴板中的新会话链接", Toast.LENGTH_SHORT).show();
             showWeb(clip);
             return true;
@@ -253,6 +543,7 @@ public class MainActivity extends Activity {
 
     private void showWeb(String url) {
         destroyWeb();
+        onErrorPage = false;
         loadedUrl = url;
         allowedHost = Uri.parse(url).getHost();
         webView = new WebView(this);
@@ -287,14 +578,28 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (request.isForMainFrame()) {
-                    showError("页面加载失败(错误码 " + error.getErrorCode() + ")");
+                    int code = error.getErrorCode();
+                    String msg;
+                    if (code == WebViewClient.ERROR_HOST_LOOKUP || code == WebViewClient.ERROR_CONNECT
+                            || code == WebViewClient.ERROR_TIMEOUT) {
+                        msg = "网络连接失败,请检查手机网络后重试。";
+                    } else if (code == WebViewClient.ERROR_FILE_NOT_FOUND || code == WebViewClient.ERROR_BAD_URL) {
+                        msg = "会话链接可能已失效或地址有误。";
+                    } else {
+                        msg = "页面加载失败(错误码 " + code + ")。";
+                    }
+                    showError(msg);
                 }
             }
 
             @Override
             public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
                 if (request.isForMainFrame()) {
-                    showError("服务器返回错误(HTTP " + errorResponse.getStatusCode() + ")");
+                    int sc = errorResponse.getStatusCode();
+                    String msg = (sc == 404 || sc == 410)
+                            ? "会话链接已失效(HTTP " + sc + "),请在电脑端重新生成远程链接。"
+                            : "服务器返回错误(HTTP " + sc + "),请稍后重试。";
+                    showError(msg);
                 }
             }
         });
@@ -376,10 +681,15 @@ public class MainActivity extends Activity {
         fab.setVisibility(prefs.getBoolean(KEY_SHOW_FAB, true) ? View.VISIBLE : View.GONE);
         container.addView(fab, fabLp);
         container.post(() -> {
-            // 换设备/旋转后旧位置可能越界,布局完成时兜底拉回屏内
+            // 换设备/旋转后旧位置可能越界,布局完成时兜底拉回内容区安全边距内(避开状态栏/手势条方向)
             FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) fab.getLayoutParams();
-            lp.leftMargin = clamp(lp.leftMargin, 0, Math.max(0, container.getWidth() - fab.getWidth()));
-            lp.topMargin = clamp(lp.topMargin, 0, Math.max(0, container.getHeight() - fab.getHeight()));
+            int padH = dp(12);
+            int padTop = dp(8);
+            int padBottom = dp(24);
+            lp.leftMargin = clamp(lp.leftMargin, padH,
+                    Math.max(padH, container.getWidth() - fab.getWidth() - padH));
+            lp.topMargin = clamp(lp.topMargin, padTop,
+                    Math.max(padTop, container.getHeight() - fab.getHeight() - padBottom));
             fab.setLayoutParams(lp);
         });
 
@@ -425,18 +735,53 @@ public class MainActivity extends Activity {
                         }
                         if (moved) {
                             View parent = (View) v.getParent();
-                            lp.leftMargin = clamp((int) (startL + dx), 0, Math.max(0, parent.getWidth() - v.getWidth()));
-                            lp.topMargin = clamp((int) (startT + dy), 0, Math.max(0, parent.getHeight() - v.getHeight()));
+                            int padH = dp(12);
+                            lp.leftMargin = clamp((int) (startL + dx), padH,
+                                    Math.max(padH, parent.getWidth() - v.getWidth() - padH));
+                            lp.topMargin = clamp((int) (startT + dy), dp(8),
+                                    Math.max(dp(8), parent.getHeight() - v.getHeight() - dp(24)));
                             v.setLayoutParams(lp);
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
                         if (moved) {
-                            getPreferences(Context.MODE_PRIVATE).edit()
-                                    .putInt(KEY_FAB_X, lp.leftMargin)
-                                    .putInt(KEY_FAB_Y, lp.topMargin).apply();
-                            Toast.makeText(MainActivity.this, "按钮位置已保存", Toast.LENGTH_SHORT).show();
+                            // 松手后自动吸附到左/右边缘,避免悬浮钮停在屏幕中间挡住会话内容
+                            View parent = (View) v.getParent();
+                            final int parentW = parent != null ? parent.getWidth() : 0;
+                            final int fabW = v.getWidth();
+                            final int margin = dp(12);
+                            final int targetL;
+                            if (parentW > 0 && (lp.leftMargin + fabW / 2 < parentW / 2)) {
+                                targetL = margin;
+                            } else if (parentW > 0) {
+                                targetL = Math.max(margin, parentW - fabW - margin);
+                            } else {
+                                targetL = lp.leftMargin;
+                            }
+                            final FrameLayout.LayoutParams flp = lp;
+                            if (parentW > 0 && lp.leftMargin != targetL) {
+                                ValueAnimator anim = ValueAnimator.ofInt(lp.leftMargin, targetL);
+                                anim.setDuration(220);
+                                anim.setInterpolator(new DecelerateInterpolator());
+                                anim.addUpdateListener(a -> {
+                                    flp.leftMargin = (Integer) a.getAnimatedValue();
+                                    v.setLayoutParams(flp);
+                                });
+                                anim.addListener(new AnimatorListenerAdapter() {
+                                    @Override
+                                    public void onAnimationEnd(Animator animation) {
+                                        getPreferences(Context.MODE_PRIVATE).edit()
+                                                .putInt(KEY_FAB_X, targetL)
+                                                .putInt(KEY_FAB_Y, flp.topMargin).apply();
+                                    }
+                                });
+                                anim.start();
+                            } else {
+                                getPreferences(Context.MODE_PRIVATE).edit()
+                                        .putInt(KEY_FAB_X, lp.leftMargin)
+                                        .putInt(KEY_FAB_Y, lp.topMargin).apply();
+                            }
                         } else if (e.getActionMasked() == MotionEvent.ACTION_UP) {
                             showMenu();
                         }
@@ -489,9 +834,28 @@ public class MainActivity extends Activity {
             } catch (Exception ignored) {
             }
         }));
+        box.addView(panelRow("↗", "分享会话", "把会话链接发送到微信/QQ 等", v -> {
+            if (url == null || url.isEmpty()) {
+                toast("当前无有效会话链接");
+                return;
+            }
+            try {
+                Intent send = new Intent(Intent.ACTION_SEND);
+                send.setType("text/plain");
+                send.putExtra(Intent.EXTRA_TEXT, url);
+                startActivity(Intent.createChooser(send, "分享 ZCode 远程会话"));
+            } catch (Exception e) {
+                toast("无法拉起系统分享");
+            }
+        }));
+        box.addView(panelRow("🕒", "历史会话", "查看或切换最近使用过的会话", v -> showHistoryDialog()));
         box.addView(panelRow("⬇", "检查更新", "查看 GitHub 上是否有新版本", v -> checkUpdate(true)));
 
         box.addView(panelHeader("设置"));
+        box.addView(panelSwitch("保持屏幕常亮", "监视任务时防止手机自动休眠", KEY_KEEP_SCREEN_ON, (c) -> {
+            applyKeepScreenOn(c);
+            Toast.makeText(this, c ? "已开启屏幕常亮" : "已恢复系统休眠", Toast.LENGTH_SHORT).show();
+        }));
         box.addView(panelSwitch("悬浮按钮", "显示会话页的 ⋮ 菜单按钮", KEY_SHOW_FAB, (c) -> {
             if (fab != null) {
                 fab.setVisibility(c ? View.VISIBLE : View.GONE);
@@ -619,13 +983,24 @@ public class MainActivity extends Activity {
     private void confirmClearData() {
         new AlertDialog.Builder(this)
                 .setTitle("清除网页数据")
-                .setMessage("会删除网页的 Cookie、缓存和本地存储。\n\n用于网页卡死、状态错乱时强制重置;不影响已保存的远程链接。确定继续吗?")
+                .setMessage("会删除网页的 Cookie、缓存、本地存储(localStorage/IndexedDB)和表单记录。\n\n用于网页卡死、状态错乱时强制重置;不影响已保存的远程链接。确定继续吗?")
                 .setPositiveButton("清除并刷新", (d, w) -> {
                     dismissMenu();
                     CookieManager.getInstance().removeAllCookies(null);
+                    CookieManager.getInstance().flush();
+                    // localStorage / IndexedDB / WebSQL / ServiceWorker 等网页存储,
+                    // 远程会话的 relay 登录态大概率在这里,不清等于没重置
+                    try {
+                        WebStorage.getInstance().deleteAllData();
+                    } catch (Exception ignored) {
+                    }
                     if (webView != null) {
                         webView.clearCache(true);
                         webView.clearFormData();
+                        try {
+                            WebViewDatabase.getInstance(this).clearHttpAuthUsernamePassword();
+                        } catch (Exception ignored) {
+                        }
                         webView.reload();
                     }
                     Toast.makeText(this, "网页数据已清除,正在刷新", Toast.LENGTH_SHORT).show();
@@ -646,6 +1021,7 @@ public class MainActivity extends Activity {
 
     private void showError(String message) {
         final String url = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
+        onErrorPage = true;
         loadedUrl = null;
         destroyWeb();
         LinearLayout box = darkBox();
@@ -657,7 +1033,7 @@ public class MainActivity extends Activity {
         box.addView(icon);
 
         TextView err = new TextView(this);
-        err.setText(message + "\n可能是网络波动或会话链接已失效。");
+        err.setText(message);
         err.setTextColor(RED);
         err.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         err.setPadding(0, 0, 0, dp(20));
@@ -684,6 +1060,7 @@ public class MainActivity extends Activity {
     }
 
     private void showSetup(String prefill, String error) {
+        onErrorPage = false;
         loadedUrl = null;
         destroyWeb();
         LinearLayout box = darkBox();
@@ -742,6 +1119,7 @@ public class MainActivity extends Activity {
                 return;
             }
             getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_URL, url).apply();
+            recordHistory(url);
             showWeb(url);
         });
 
@@ -759,6 +1137,24 @@ public class MainActivity extends Activity {
             input.setText(m.find() ? m.group() : clip.trim());
             Toast.makeText(this, "已粘贴,确认后点「保存并打开」", Toast.LENGTH_SHORT).show();
         });
+
+        Button scan = new Button(this);
+        scan.setText("扫码绑定");
+        styleSecondary(scan);
+        box.addView(scan, buttonLp());
+        scan.setOnClickListener(v -> {
+            try {
+                startActivityForResult(new Intent(this, ScanActivity.class), REQ_SCAN);
+            } catch (Exception e) {
+                Toast.makeText(this, "无法启动扫码:请确认已授予相机权限", Toast.LENGTH_LONG).show();
+            }
+        });
+
+        Button hist = new Button(this);
+        hist.setText("历史会话");
+        styleSecondary(hist);
+        box.addView(hist, buttonLp());
+        hist.setOnClickListener(v -> showHistoryDialog());
 
         Button check = new Button(this);
         check.setText("检查更新");
@@ -860,6 +1256,9 @@ public class MainActivity extends Activity {
     private void checkUpdate(final boolean manual) {
         if (manual) {
             toast("正在检查更新…");
+        } else {
+            getPreferences(Context.MODE_PRIVATE).edit()
+                    .putLong(KEY_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply();
         }
         new Thread(() -> {
             String version = null;
@@ -1075,6 +1474,20 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_SCAN) {
+            if (resultCode == RESULT_OK && data != null) {
+                String scanned = data.getStringExtra(ScanActivity.EXTRA_URL);
+                if (scanned != null) {
+                    Matcher m = REMOTE_URL.matcher(scanned);
+                    String url = m.find() ? m.group() : scanned.trim();
+                    getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_URL, url).apply();
+                    recordHistory(url);
+                    Toast.makeText(this, "扫码成功,正在打开会话", Toast.LENGTH_SHORT).show();
+                    showWeb(url);
+                }
+            }
+            return;
+        }
         if (requestCode == REQ_FILE && fileCallback != null) {
             Uri[] results = null;
             if (resultCode == RESULT_OK && data != null) {
@@ -1097,8 +1510,14 @@ public class MainActivity extends Activity {
     public void onBackPressed() {
         if (webView != null && webView.canGoBack()) {
             webView.goBack();
-        } else {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastBackTime < 2000L) {
             super.onBackPressed();
+        } else {
+            lastBackTime = now;
+            Toast.makeText(this, "再按一次退出 ZCode Remote", Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -1106,7 +1525,20 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         dismissUpdateDialog();
         dismissMenu();
-        unregisterReceiver(downloadDone);
+        try {
+            unregisterReceiver(downloadDone);
+        } catch (Exception ignored) {
+        }
+        if (networkCallback != null) {
+            try {
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    cm.unregisterNetworkCallback(networkCallback);
+                }
+            } catch (Exception ignored) {
+            }
+            networkCallback = null;
+        }
         destroyWeb();
         super.onDestroy();
     }

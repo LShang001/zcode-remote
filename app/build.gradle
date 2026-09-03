@@ -8,12 +8,18 @@ android {
         applicationId "com.zcode.remote"
         minSdk 26
         targetSdk 34
-        versionCode 8
-        versionName "1.7"
+        versionCode 10
+        versionName "1.9"
     }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+dependencies {
+    // 扫码绑定:只用 zxing 的纯 Java 解码核心(不含 Android UI/资源,约 0.5 MB,零传递依赖);
+    // 相机预览自己用 Camera1 写,不引入 zxing-android-embedded 全家桶
+    implementation 'com.google.zxing:core:3.5.3'
 }

@@ -10,3 +10,6 @@ local.properties
 
 # 发版产物走 GitHub Releases 托管,不进 git
 ZCodeRemote.apk
+
+# 本机 ZCode 工具目录
+.zcode/

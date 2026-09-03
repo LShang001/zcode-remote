@@ -6,7 +6,7 @@
 ## 项目
 
 把 ZCode 桌面端的远程控制网页(`https://zcode.z.ai/remote/...`)封装成安卓独立 App:WebView 全屏、无浏览器 UI、自带桌面图标。网页是第三方的,本仓库只是壳。
-**成熟度:个人装机使用。技术栈:纯 Java + compileSdk 34,零第三方依赖,无测试与 linter。**
+**成熟度:个人装机使用。技术栈:纯 Java + compileSdk 34,UI 纯代码构建无 layout XML。唯一第三方依赖是 `com.google.zxing:core`(纯 Java 二维码解码核心,扫码用;相机预览自己用 Camera1 写,不引 zxing-android-embedded)。无测试与 linter。**
 
 ## 命令
 
@@ -33,7 +33,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 
 | 路径 | 为什么必须知道 |
 |------|---------------|
-| `app/src/main/java/com/zcode/remote/MainActivity.java` | 唯一源文件:全部逻辑与 UI 都在这约 450 行里,纯代码布局,不存在 layout XML |
+| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、更新、历史会话等逻辑与 UI 都在这(约 1400 行),纯代码布局,不存在 layout XML |
+| `app/src/main/java/com/zcode/remote/ScanActivity.java` | 扫码绑定页:Camera1 预览 + zxing core 解码,识别远程二维码回传链接给 MainActivity |
 | `gradle.properties` | `android.overridePathCheck=true` 支撑着中文路径构建,删了构建必挂 |
 | `docs/screenshots/` | v1.1 五张视觉基准图;改 UI 后逐张对照,防回归 |
 | `docs/emulator-review.md` | 视觉审查完整流程(预置链接/必查画面清单);改 UI 或发版前读 |
@@ -41,7 +42,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 ## 原则
 
 1. **壳的本分** — 网页内的功能与 UI 归 ZCode 官方;壳只做装载、链接管理和移动体验,增强走系统能力(下载管理、外链跳浏览器),保持不注入 CSS/JS 改网页(会随网页更新碎掉)
-2. **单文件极简** — 逻辑收进 MainActivity.java,UI 用代码构建,保持零第三方依赖;每加一个依赖先问能不能不加
+2. **极简优先** — 逻辑收进 MainActivity(扫码独立成 ScanActivity),UI 用代码构建;第三方依赖目前仅 zxing:core 一个纯 Java 库;每加一个依赖先问能不能不加(扫码用 core+Camera1 而非 zxing-android-embedded 全家桶就是这个原则)
 3. **发版四同步** — `versionCode` +1、`versionName`、设置页 footer 版本(常量 `APP_VERSION`)、GitHub Release(tag `vX.Y` + 上传 APK),一次发版四处同改;漏发 Release 等于用户永远收不到更新
 4. **眼见为实** — 改 UI 后在模拟器跑起来截图,用 Read 亲眼看图确认才算完成
 
@@ -54,7 +55,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 
 **修改前必须确认**:
 - 升级 AGP(现 8.5.2)/ Gradle(现 8.9)/ compileSdk(现 34)→ 先确认与 JDK 17 及中文路径兼容
-- Manifest 新增权限 → 先确认网页功能确实需要(当前仅 INTERNET)
+- Manifest 新增权限 → 先确认功能确实需要(当前为 INTERNET 联网、ACCESS_NETWORK_STATE 网络恢复重连、REQUEST_INSTALL_PACKAGES 更新安装、POST_NOTIFICATIONS 13+下载通知、CAMERA 扫码;CAMERA 配 `<uses-feature required="false">`,无摄像头设备仍可安装)
 
 ## 踩坑记录
 
@@ -66,6 +67,10 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - GitHub asset 真实下载走 `objects.githubusercontent.com`,本机网络对它时通时断 — App 里 API 检查成功但 DownloadManager 永远 0 字节时,先怀疑该域被阻断(宿主 `curl -sIL <asset URL>` 可对照);模拟器验证安装链路可用 root 改 downloads.db 把条目置 status=200 并指向 push 进去的 APK(来源:2026-08-21 v1.6 实测)
 - 模拟器 `emu network speed` 限速命令会弄丢 guest 默认路由(ip route 无 default),且重启/wipe 前难恢复 — 测完限速记得恢复;真要限速测下载,优先在真机或抓中间态截图为主(来源:2026-08-21 v1.6 实测)
 - adb 预置 `shared_prefs/MainActivity.xml` 时 URL 里的 `&` 要写成 `&amp;`,否则链接被 XML 截断(来源:模拟器测试实测)
+- Git Bash 里 `adb push/pull/shell <unix路径>`(如 `/sdcard/x`、`/data/data/...`)会被 MSYS 当成 Windows 路径转换成 `D:/Program Files/Git/sdcard/...` 导致失败 — 在命令前加 `MSYS_NO_PATHCONV=1`(如 `MSYS_NO_PATHCONV=1 adb push a.xml /sdcard/a.xml`);`screencap -p <设备路径>` 也会因同样原因报 usage,改用 `adb exec-out screencap -p > 本地.png`(来源:2026-09-04 v1.8 模拟器实测)
+- `ConnectivityManager.registerNetworkCallback` 需要 `ACCESS_NETWORK_STATE` 权限,没声明会抛 SecurityException;若回调注册处用 try-catch 吞掉异常,会表现为"回调从不触发"且无任何报错日志 — 网络恢复自动重连不工作时先查 Manifest 有没有这个权限(来源:2026-09-04 v1.9 实测)
+- `WebViewClient.ERROR_NETWORK_CHANGED` / `ERROR_INTERNET_DISCONNECTED` 这两个错误码常量在 android.webkit.WebViewClient 里并不存在(写了会编译报错);断网判据用 ERROR_HOST_LOOKUP / ERROR_CONNECT / ERROR_TIMEOUT 即可(来源:2026-09-04 v1.9 编译实测)
+- "清除网页数据"只调 `clearCache`+`removeAllCookies` 清不掉 localStorage/IndexedDB — 远程网页的会话/relay 登录态存在 DOM storage 里,必须额外 `WebStorage.getInstance().deleteAllData()`(WebSettings 开了 domStorage/database);另配 `WebViewDatabase.clearHttpAuthUsernamePassword()` 清表单/HTTP 认证(来源:2026-09-04 v1.9)
 
 ## 知识沉淀协议
 
