@@ -6,6 +6,7 @@
 ## 项目
 
 把 ZCode 桌面端的远程控制网页(`https://zcode.z.ai/remote/...`)封装成安卓独立 App:WebView 全屏、无浏览器 UI、自带桌面图标。网页是第三方的,本仓库只是壳。
+**目标真机(2026-09-04 用户提供):vivo X200 Ultra —— 6.78" 2808×1260(~454ppi,密度桶 480)、Android 15/OriginOS 5。视觉审查与分辨率适配问题以此机为准,模拟器基准屏向它对齐。**
 **成熟度:个人装机使用。技术栈:纯 Java + compileSdk 34,UI 纯代码构建无 layout XML。唯一第三方依赖是 `com.google.zxing:core`(纯 Java 二维码解码核心,扫码用;相机预览自己用 Camera1 写,不引 zxing-android-embedded)。无测试与 linter。**
 
 ## 命令
@@ -25,9 +26,12 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 ```
 
 ```bash
-# 启动模拟器做视觉审查(AVD 名 zc,已建好,WHPX 加速可用)
-"$LOCALAPPDATA/Android/Sdk/emulator/emulator.exe" -avd zc -no-snapshot-save -no-boot-anim -gpu swiftshader_indirect &
+# 启动模拟器做视觉审查(AVD:zc=Pixel6 标准屏;x200=X200 Ultra 近似屏 1260x2808@480,加 -port 5556 可并存)
+# 别加 -no-snapshot-save:快照快启实测 4s vs 冷启 19s;退出用 adb emu kill(自动存快照);规范截图/扫码E2E/断网重连的完整流程读 docs/emulator-review.md
+"$LOCALAPPDATA/Android/Sdk/emulator/emulator.exe" -avd zc -no-boot-anim -gpu swiftshader_indirect &
 ```
+
+**模拟器收尾规约**:android-emulator 插件用完从不自动关(设计如此,复用热机),遗留进程会一直吃 2-3GB 内存——凡本次任务用过模拟器,收尾时必须**主动询问用户"模拟器要关掉吗"**:答关 → 停止该模拟器并用 `adb devices` 确认清空;答留 → 保持热机不动。只关自己用过的那台(serial 对得上),不动其他设备(来源:2026-09-04 用户指定,起因是遗留进程挂了数小时未被发现)
 
 ## 关键路径
 
@@ -67,7 +71,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - GitHub asset 真实下载走 `objects.githubusercontent.com`,本机网络对它时通时断 — App 里 API 检查成功但 DownloadManager 永远 0 字节时,先怀疑该域被阻断(宿主 `curl -sIL <asset URL>` 可对照);模拟器验证安装链路可用 root 改 downloads.db 把条目置 status=200 并指向 push 进去的 APK(来源:2026-08-21 v1.6 实测)
 - 模拟器 `emu network speed` 限速命令会弄丢 guest 默认路由(ip route 无 default),且重启/wipe 前难恢复 — 测完限速记得恢复;真要限速测下载,优先在真机或抓中间态截图为主(来源:2026-08-21 v1.6 实测)
 - adb 预置 `shared_prefs/MainActivity.xml` 时 URL 里的 `&` 要写成 `&amp;`,否则链接被 XML 截断(来源:模拟器测试实测)
-- Git Bash 里 `adb push/pull/shell <unix路径>`(如 `/sdcard/x`、`/data/data/...`)会被 MSYS 当成 Windows 路径转换成 `D:/Program Files/Git/sdcard/...` 导致失败 — 在命令前加 `MSYS_NO_PATHCONV=1`(如 `MSYS_NO_PATHCONV=1 adb push a.xml /sdcard/a.xml`);`screencap -p <设备路径>` 也会因同样原因报 usage,改用 `adb exec-out screencap -p > 本地.png`(来源:2026-09-04 v1.8 模拟器实测)
+- Git Bash 里 `adb push/pull/shell <unix路径>`(如 `/sdcard/x`、`/data/data/...`)会被 MSYS 当成 Windows 路径转换成 `D:/Program Files/Git/sdcard/...` 导致失败 — 在命令前加 `MSYS_NO_PATHCONV=1`(如 `MSYS_NO_PATHCONV=1 adb push a.xml /sdcard/a.xml`);`screencap -p <设备路径>` 也会因同样原因报 usage,改用 `adb exec-out screencap -p > 本地.png`;注意该前缀只作用于紧随的一条命令,同一脚本里后续 adb 命令要各自加(来源:2026-09-04 v1.8 模拟器实测,同日补逐命令生效细节)
+- 系统照片选择器(Photo Picker)只认 media store 索引,`adb push` 图片进去后选择器里看不到("No photos or videos")— 必须再执行 `adb shell content call --uri content://media --method scan_file --arg /sdcard/Download/xx.png` 触发入库;扫码相册选图的模拟器测试依赖这一步(来源:2026-09-04 扫码 E2E 实测)
 - `ConnectivityManager.registerNetworkCallback` 需要 `ACCESS_NETWORK_STATE` 权限,没声明会抛 SecurityException;若回调注册处用 try-catch 吞掉异常,会表现为"回调从不触发"且无任何报错日志 — 网络恢复自动重连不工作时先查 Manifest 有没有这个权限(来源:2026-09-04 v1.9 实测)
 - `WebViewClient.ERROR_NETWORK_CHANGED` / `ERROR_INTERNET_DISCONNECTED` 这两个错误码常量在 android.webkit.WebViewClient 里并不存在(写了会编译报错);断网判据用 ERROR_HOST_LOOKUP / ERROR_CONNECT / ERROR_TIMEOUT 即可(来源:2026-09-04 v1.9 编译实测)
 - "清除网页数据"只调 `clearCache`+`removeAllCookies` 清不掉 localStorage/IndexedDB — 远程网页的会话/relay 登录态存在 DOM storage 里,必须额外 `WebStorage.getInstance().deleteAllData()`(WebSettings 开了 domStorage/database);另配 `WebViewDatabase.clearHttpAuthUsernamePassword()` 清表单/HTTP 认证(来源:2026-09-04 v1.9)
@@ -79,10 +84,11 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 > 本协议在对话中自动生效。不是规章制度——是给你未来会话的自己的**记忆外挂**。
 > 遵守这些规则 = 帮未来的自己。1 分钟的记录 = 下次会话省 10 分钟重学。
 > 如果此轮触发检查没有值得记录的内容,沉默——不作声比废话强。
+> **存放位置(2026-09-04 用户指定)**:所有记忆一律落到项目内共享位置——日期笔记进 `docs/memory/`,耐久规则直接进本文件对应节;各 agent 的私有记忆只能作补充索引,不得作为唯一存放处,保证 Claude Code / Codex / Cursor / ZCode 等工具都能读到。
 
 | 规则 | 触发条件 | 行为 |
 |------|---------|------|
-| **P1** | 用户说 "记住"/"记下来"/"沉淀" | 写 `docs/memory/YYYY-MM-DD-<摘要>.md`(3-5 要点),追问是否同步到 AGENTS.md |
+| **P1** | 用户说 "记住"/"记下来"/"沉淀" | 写 `docs/memory/YYYY-MM-DD-<摘要>.md`(3-5 要点),耐久部分**直接**同步进本文件对应节(不再追问是否同步) |
 | **P2** | 用户纠正错误("不对"/"错了"/"应该是") | 如学到项目特定知识 → 追加到 §踩坑记录:`<错误> — <正确>(来源:<日期>)` |
 | **P3** | 自主发现非显然约定 | 追加到 AGENTS.md 最相关节,简短告知用户 |
 | **P4** | 同一流程被指导 ≥3 次 | 向用户提议用 **skill-creator-plus** 封装为项目 Skill |
