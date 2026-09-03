@@ -77,7 +77,7 @@ public class MainActivity extends Activity {
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "2.1";
+    private static final String APP_VERSION = "2.2";
     static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
     private static final String KEY_HISTORY = "history_urls";
     private static final int MAX_HISTORY = 8;
@@ -89,8 +89,9 @@ public class MainActivity extends Activity {
     // 更新安装包下载源:国内 GitHub 加速前缀优先(把完整 github.com 下载 URL 拼在后面),
     // 失败或卡住自动切下一个,全部不可用再回退 GitHub 官方源。免费公共代理可用性会变,多放几个兜底。
     private static final String[] DL_MIRRORS = {
-            "https://ghfast.top/",
+            // gh-proxy.com 用户真机实测可用(2026-09-04),排第一优先命中
             "https://gh-proxy.com/",
+            "https://ghfast.top/",
             "https://gh.llkk.cc/",
             "https://ghproxy.net/"
     };
