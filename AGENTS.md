@@ -71,6 +71,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - `ConnectivityManager.registerNetworkCallback` 需要 `ACCESS_NETWORK_STATE` 权限,没声明会抛 SecurityException;若回调注册处用 try-catch 吞掉异常,会表现为"回调从不触发"且无任何报错日志 — 网络恢复自动重连不工作时先查 Manifest 有没有这个权限(来源:2026-09-04 v1.9 实测)
 - `WebViewClient.ERROR_NETWORK_CHANGED` / `ERROR_INTERNET_DISCONNECTED` 这两个错误码常量在 android.webkit.WebViewClient 里并不存在(写了会编译报错);断网判据用 ERROR_HOST_LOOKUP / ERROR_CONNECT / ERROR_TIMEOUT 即可(来源:2026-09-04 v1.9 编译实测)
 - "清除网页数据"只调 `clearCache`+`removeAllCookies` 清不掉 localStorage/IndexedDB — 远程网页的会话/relay 登录态存在 DOM storage 里,必须额外 `WebStorage.getInstance().deleteAllData()`(WebSettings 开了 domStorage/database);另配 `WebViewDatabase.clearHttpAuthUsernamePassword()` 清表单/HTTP 认证(来源:2026-09-04 v1.9)
+- 更新包下载默认走 `DL_MIRRORS` 里的 ghproxy 式加速前缀(把完整 GitHub 下载 URL 拼在代理域名后面),失败/20 秒无字节增长自动换源,镜像用尽→官方源→再补一轮才报最终失败 — 这类免费公共代理可用性会变,发现某节点长期 000/404 就从 `DL_MIRRORS` 换掉;新代理先 `curl -r 0-3` 拉头几字节验证:206 + PK 头(`504b0304`)+ `application/vnd.android.package-archive` 才算真能流出 APK(HEAD 200 可能是假象)(来源:2026-09-04 v2.0 模拟器端到端实测)
 
 ## 知识沉淀协议
 

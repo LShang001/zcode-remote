@@ -81,7 +81,7 @@ public class MainActivity extends Activity {
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "1.9";
+    private static final String APP_VERSION = "2.0";
     static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
     private static final String KEY_HISTORY = "history_urls";
     private static final int MAX_HISTORY = 8;
@@ -90,6 +90,15 @@ public class MainActivity extends Activity {
     private static final String RELEASE_API = "https://api.github.com/repos/LShang001/zcode-remote/releases/latest";
     private static final Pattern TAG_JSON = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9][0-9.]*)\"");
     private static final Pattern APK_URL_JSON = Pattern.compile("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.apk)\"");
+    // 更新安装包下载源:国内 GitHub 加速前缀优先(把完整 github.com 下载 URL 拼在后面),
+    // 失败或卡住自动切下一个,全部不可用再回退 GitHub 官方源。免费公共代理可用性会变,多放几个兜底。
+    private static final String[] DL_MIRRORS = {
+            "https://ghfast.top/",
+            "https://gh-proxy.com/",
+            "https://gh.llkk.cc/",
+            "https://ghproxy.net/"
+    };
+    private static final long DL_STALL_TIMEOUT_MS = 20_000L; // 下载卡住(无字节增长)判定阈值,超时切换下一源
     private static final int BG = 0xFF0F1014;
     private static final int FG = 0xFFEDEEF0;
     private static final int FG_DIM = 0xFF9AA0A6;
@@ -120,6 +129,11 @@ public class MainActivity extends Activity {
     private long lastBackTime = 0L;
     private ConnectivityManager.NetworkCallback networkCallback;
     private boolean onErrorPage = false;
+    // 更新下载源切换状态:-1..N-2 为 DL_MIRRORS 下标,N-1 表示官方源;-1 表示尚未开始
+    private int dlSourceIndex = -1;
+    private int dlRound = 0;
+    private long dlLastBytes = -1L;
+    private long dlLastProgressAt = 0L;
     private final Runnable progressPoller = new Runnable() {
         @Override
         public void run() {
@@ -155,7 +169,17 @@ public class MainActivity extends Activity {
                     updateBar.setProgress(pct);
                     String extra = status == DownloadManager.STATUS_PAUSED ? " · 等待网络…" : "";
                     updateText.setText(pct + "% · " + formatSize(done) + " / "
-                            + (total > 0 ? formatSize(total) : "?") + extra);
+                            + (total > 0 ? formatSize(total) : "?") + extra + " · " + dlSourceLabel());
+                }
+                // 卡住检测:RUNNING 但字节数长时间不增长(代理挂起/0 字节),超时自动换下一个源
+                long now = System.currentTimeMillis();
+                if (done > dlLastBytes) {
+                    dlLastBytes = done;
+                    dlLastProgressAt = now;
+                } else if (status == DownloadManager.STATUS_RUNNING
+                        && now - dlLastProgressAt > DL_STALL_TIMEOUT_MS) {
+                    failDownload();
+                    return;
                 }
             } finally {
                 c.close();
@@ -1322,7 +1346,7 @@ public class MainActivity extends Activity {
     private void offerUpdate(final String version, final String url) {
         new AlertDialog.Builder(this)
                 .setTitle("发现新版本 v" + version)
-                .setMessage("建议更新以获得最新修复。\n\n下载完成后会自动弹出安装界面,首次安装需允许本应用\"安装未知应用\"。")
+                .setMessage("建议更新以获得最新修复。\n\n国内网络将自动优先走加速源下载,失败会自动切换;下载完成后会自动弹出安装界面,首次安装需允许本应用\"安装未知应用\"。")
                 .setPositiveButton("立即更新", (d, w) -> downloadUpdate(version, url))
                 .setNegativeButton("暂不", null)
                 .show();
@@ -1331,17 +1355,71 @@ public class MainActivity extends Activity {
     private void downloadUpdate(String version, String url) {
         pendingVersion = version;
         pendingUrl = url;
+        dlSourceIndex = -1;
+        dlRound = 0;
+        startDownloadFromNextSource();
+    }
+
+    /** 依次尝试:国内加速镜像 → GitHub 官方源;失败/卡住自动换下一个,两轮用尽才报最终失败 */
+    private void startDownloadFromNextSource() {
+        dlSourceIndex++;
+        if (dlSourceIndex > DL_MIRRORS.length) {
+            if (dlRound < 1) {
+                // 一轮走完全部源都失败:再从头来一轮(代理可能刚恢复),第二轮结束仍失败则放弃
+                dlRound++;
+                dlSourceIndex = -1;
+                toast("所有下载源均失败,重新尝试…");
+                startDownloadFromNextSource();
+                return;
+            }
+            dismissUpdateDialog();
+            new AlertDialog.Builder(this)
+                    .setTitle("下载失败")
+                    .setMessage("已尝试全部国内加速镜像与 GitHub 官方源,均未成功。\n\n可能是当前网络无法访问这些站点,建议稍后重试,或在电脑端下载后传到手机安装。")
+                    .setPositiveButton("知道了", null)
+                    .show();
+            return;
+        }
+        String target = (dlSourceIndex < DL_MIRRORS.length)
+                ? DL_MIRRORS[dlSourceIndex] + pendingUrl
+                : pendingUrl;
+        dlLastBytes = -1L;
+        dlLastProgressAt = System.currentTimeMillis();
         try {
-            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(target));
             req.setMimeType("application/vnd.android.package-archive");
             req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
             req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,
-                    "ZCodeRemote-v" + version + ".apk");
+                    "ZCodeRemote-v" + pendingVersion + ".apk");
             pendingDownloadId = ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(req);
-            showDownloadProgress(version);
+            if (updateDialog == null || !updateDialog.isShowing()) {
+                showDownloadProgress(pendingVersion);
+            } else {
+                toast("正在切换下载源:" + dlSourceLabel());
+                // 对话框已存在时不会重建,轮询也不会自动续上,这里显式重启
+                if (updateHandler == null) {
+                    updateHandler = new Handler(Looper.getMainLooper());
+                }
+                updateHandler.removeCallbacks(progressPoller);
+                updateHandler.postDelayed(progressPoller, 400);
+            }
         } catch (Exception e) {
             failDownload();
         }
+    }
+
+    private String dlSourceLabel() {
+        if (dlSourceIndex < 0) {
+            return "";
+        }
+        if (dlSourceIndex < DL_MIRRORS.length) {
+            try {
+                return "加速源 " + (dlSourceIndex + 1);
+            } catch (Exception ignored) {
+                return "加速源";
+            }
+        }
+        return "GitHub 官方";
     }
 
     private void showDownloadProgress(String version) {
@@ -1389,7 +1467,6 @@ public class MainActivity extends Activity {
     }
 
     private void failDownload() {
-        String version = pendingVersion == null ? "" : pendingVersion;
         if (pendingDownloadId >= 0) {
             try {
                 ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).remove(pendingDownloadId);
@@ -1397,17 +1474,11 @@ public class MainActivity extends Activity {
             }
             pendingDownloadId = -1L;
         }
-        dismissUpdateDialog();
-        new AlertDialog.Builder(this)
-                .setTitle("下载失败")
-                .setMessage("新版本 v" + version + " 下载未完成,可能是网络波动。")
-                .setPositiveButton("重试", (d, w) -> {
-                    if (pendingUrl != null) {
-                        downloadUpdate(version, pendingUrl);
-                    }
-                })
-                .setNegativeButton("取消", null)
-                .show();
+        // 当前源失败:换下一个下载源(镜像 → 官方 → 再来一轮),轮次用尽由 startDownloadFromNextSource 报最终失败
+        if (pendingUrl != null) {
+            toast(dlSourceLabel() + " 不可用,切换下载源…");
+            startDownloadFromNextSource();
+        }
     }
 
     private void dismissUpdateDialog() {
