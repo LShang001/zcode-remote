@@ -52,10 +52,6 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import android.animation.Animator;
-import android.animation.AnimatorListenerAdapter;
-import android.animation.ValueAnimator;
-import android.view.animation.DecelerateInterpolator;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.util.ArrayList;
@@ -81,7 +77,7 @@ public class MainActivity extends Activity {
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "2.0";
+    private static final String APP_VERSION = "2.1";
     static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
     private static final String KEY_HISTORY = "history_urls";
     private static final int MAX_HISTORY = 8;
@@ -770,42 +766,10 @@ public class MainActivity extends Activity {
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
                         if (moved) {
-                            // 松手后自动吸附到左/右边缘,避免悬浮钮停在屏幕中间挡住会话内容
-                            View parent = (View) v.getParent();
-                            final int parentW = parent != null ? parent.getWidth() : 0;
-                            final int fabW = v.getWidth();
-                            final int margin = dp(12);
-                            final int targetL;
-                            if (parentW > 0 && (lp.leftMargin + fabW / 2 < parentW / 2)) {
-                                targetL = margin;
-                            } else if (parentW > 0) {
-                                targetL = Math.max(margin, parentW - fabW - margin);
-                            } else {
-                                targetL = lp.leftMargin;
-                            }
-                            final FrameLayout.LayoutParams flp = lp;
-                            if (parentW > 0 && lp.leftMargin != targetL) {
-                                ValueAnimator anim = ValueAnimator.ofInt(lp.leftMargin, targetL);
-                                anim.setDuration(220);
-                                anim.setInterpolator(new DecelerateInterpolator());
-                                anim.addUpdateListener(a -> {
-                                    flp.leftMargin = (Integer) a.getAnimatedValue();
-                                    v.setLayoutParams(flp);
-                                });
-                                anim.addListener(new AnimatorListenerAdapter() {
-                                    @Override
-                                    public void onAnimationEnd(Animator animation) {
-                                        getPreferences(Context.MODE_PRIVATE).edit()
-                                                .putInt(KEY_FAB_X, targetL)
-                                                .putInt(KEY_FAB_Y, flp.topMargin).apply();
-                                    }
-                                });
-                                anim.start();
-                            } else {
-                                getPreferences(Context.MODE_PRIVATE).edit()
-                                        .putInt(KEY_FAB_X, lp.leftMargin)
-                                        .putInt(KEY_FAB_Y, lp.topMargin).apply();
-                            }
+                            // 松手即停在拖放位置(可悬停在任意位置),只记录坐标,不做边缘吸附
+                            getPreferences(Context.MODE_PRIVATE).edit()
+                                    .putInt(KEY_FAB_X, lp.leftMargin)
+                                    .putInt(KEY_FAB_Y, lp.topMargin).apply();
                         } else if (e.getActionMasked() == MotionEvent.ACTION_UP) {
                             showMenu();
                         }
