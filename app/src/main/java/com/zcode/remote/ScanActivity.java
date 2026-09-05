@@ -14,6 +14,10 @@ import android.hardware.Camera;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.SurfaceHolder;
@@ -67,6 +71,13 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     private long lastDecode;
     private int previewW;
     private int previewH;
+    // 取景框引用,用于识别状态变色;状态防止"非远程二维码"Toast 每帧刷屏
+    private View frameBox;
+    private GradientDrawable frameDrawable;
+    private boolean showingMismatch = false;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static final int ACCENT_GREEN = 0xFF34C759;
+    private static final int ACCENT_RED = 0xFFFF6E6E;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -95,18 +106,19 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         root.addView(surface, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // 中央取景框
-        View frame = new View(this);
+        // 中央取景框(边框颜色随识别状态变化:蓝=扫描中,红=识别到但非远程链接,绿=成功)
+        frameBox = new View(this);
         GradientDrawable box = new GradientDrawable();
         box.setShape(GradientDrawable.RECTANGLE);
         box.setColor(Color.TRANSPARENT);
         box.setCornerRadius(dp(12));
         box.setStroke(dp(3), ACCENT);
-        frame.setBackground(box);
+        frameDrawable = box;
+        frameBox.setBackground(box);
         int boxSize = (int) (Math.min(getResources().getDisplayMetrics().widthPixels,
                 getResources().getDisplayMetrics().heightPixels) * 0.68f);
         FrameLayout.LayoutParams frameLp = new FrameLayout.LayoutParams(boxSize, boxSize, Gravity.CENTER);
-        root.addView(frame, frameLp);
+        root.addView(frameBox, frameLp);
 
         // 顶部标题栏
         LinearLayout top = new LinearLayout(this);
@@ -283,6 +295,7 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
         lastDecode = now;
+        String text = null;
         try {
             int w = previewW;
             int h = previewH;
@@ -290,43 +303,104 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
                 Camera.Size sz = c.getParameters().getPreviewSize();
                 w = sz.width;
                 h = sz.height;
+                previewW = w;
+                previewH = h;
             }
-            // 竖屏时把 NV21 的 Y 平面顺时针旋转 90°,让二维码正过来供解码
-            byte[] rotated = new byte[w * h];
-            for (int r = 0; r < h; r++) {
-                for (int col = 0; col < w; col++) {
-                    rotated[col * h + (h - 1 - r)] = data[r * w + col];
-                }
-            }
+            // 直接用相机缓冲的 Y 平面解码,不做像素旋转:QR 码有三个定位符,
+            // zxing 原生支持任意朝向(JVM 已验证 0/90/180/270° 均可直解),
+            // 每帧省掉 w*h 次像素循环与一次整块分配
+            // 取画面中心 70% 区域送解:二维码对准取景框时占比更大,减少边缘干扰
+            int cropW = w * 7 / 10;
+            int cropH = h * 7 / 10;
+            int left = (w - cropW) / 2;
+            int top = (h - cropH) / 2;
             PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(
-                    rotated, h, w, 0, 0, h, w, false);
-            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
-            Result result = reader.decodeWithState(bitmap);
-            String text = result.getText();
-            reader.reset();
-            if (text != null) {
-                Matcher m = REMOTE_URL.matcher(text);
-                if (m.find()) {
-                    returnWithUrl(m.group());
-                } else {
-                    Toast.makeText(this, "未识别到有效的 ZCode 远程链接", Toast.LENGTH_SHORT).show();
-                }
+                    data, w, h, left, top, cropW, cropH, false);
+            Result result = decodeWithFallback(source);
+            if (result != null) {
+                text = result.getText();
             }
         } catch (Exception ignored) {
             // 这一帧没解出二维码,继续等下一帧
+        } finally {
             try {
                 reader.reset();
-            } catch (Exception ignored2) {
+            } catch (Exception ignored) {
+            }
+        }
+        final String found = text;
+        if (found != null) {
+            Matcher m = REMOTE_URL.matcher(found);
+            if (m.find()) {
+                returnWithUrl(m.group());
+            } else {
+                setMismatchState(true);
+            }
+        } else if (showingMismatch) {
+            // 从"识别到异物二维码"状态回到"什么都没识别到":恢复蓝色边框,允许再次提示
+            setMismatchState(false);
+        }
+    }
+
+    /** 先 HybridBinarizer(快、多数场景),失败再 GlobalHistogramBinarizer(对低对比度/暗光更稳)兜底 */
+    private Result decodeWithFallback(com.google.zxing.LuminanceSource source) {
+        try {
+            return reader.decodeWithState(new BinaryBitmap(new HybridBinarizer(source)));
+        } catch (Exception e) {
+            try {
+                reader.reset();
+                return reader.decodeWithState(new BinaryBitmap(
+                        new com.google.zxing.common.GlobalHistogramBinarizer(source)));
+            } catch (Exception e2) {
+                return null;
             }
         }
     }
 
+    /** 取景框/Toast 状态:识别到二维码但不是远程链接时边框变红并提示一次;恢复时变回蓝色 */
+    private void setMismatchState(final boolean mismatch) {
+        showingMismatch = mismatch;
+        mainHandler.post(() -> {
+            if (frameDrawable != null) {
+                frameDrawable.setStroke(dp(3), mismatch ? ACCENT_RED : ACCENT);
+            }
+            if (mismatch) {
+                Toast.makeText(this, "识别到二维码,但不是有效的 ZCode 远程链接", Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
     private void returnWithUrl(String url) {
         decoded = true;
+        vibrate();
+        mainHandler.post(() -> {
+            if (frameDrawable != null) {
+                frameDrawable.setStroke(dp(3), ACCENT_GREEN);
+            }
+        });
         Intent out = new Intent();
         out.putExtra(EXTRA_URL, url);
         setResult(RESULT_OK, out);
-        finish();
+        mainHandler.postDelayed(this::finish, 250);
+    }
+
+    /** 识别成功短震动 30ms,反馈对准瞬间(Android 12+ 用 VibratorManager) */
+    private void vibrate() {
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                VibratorManager vm = (VibratorManager) getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                if (vm != null && vm.getDefaultVibrator() != null) {
+                    vm.getDefaultVibrator().vibrate(android.os.VibrationEffect.createOneShot(
+                            30, android.os.VibrationEffect.DEFAULT_AMPLITUDE));
+                }
+            } else {
+                Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                if (v != null) {
+                    v.vibrate(30);
+                }
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     /** 相册选图:无需存储权限,用系统图片选择器返回 content uri 后解码 */
@@ -354,7 +428,10 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    /** 把相册图片解码成二维码内容;识别到远程链接返回它,否则返回 null */
+    /** 把相册图片解码成二维码内容;识别到远程链接返回它,否则返回 null。
+     *  真实远程链接很长(200+ 字符),QR 是高版本密集码,在"二维码只占画面一部分的整窗截图"里
+     *  模块偏小,原图直接解经常失败;实测放大 2 倍 + Otsu 二值化让模块边缘锐利后可解出,
+     *  因此原图失败后追加一轮放大二值化重试 */
     private String decodeGalleryImage(Uri uri) {
         Bitmap bmp = null;
         try {
@@ -377,20 +454,12 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
             if (bmp == null) {
                 return null;
             }
-            int w = bmp.getWidth();
-            int h = bmp.getHeight();
-            int[] pixels = new int[w * h];
-            bmp.getPixels(pixels, 0, w, 0, 0, w, h);
-            RGBLuminanceSource source = new RGBLuminanceSource(w, h, pixels);
-            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
-            Result result = reader.decodeWithState(bitmap);
-            reader.reset();
-            if (result.getText() != null) {
-                Matcher m = REMOTE_URL.matcher(result.getText());
-                if (m.find()) {
-                    return m.group();
-                }
+            String url = decodeQrFromBitmap(bmp, false);
+            if (url == null) {
+                // 原图失败:放大 2 倍 + Otsu 二值化重试(密集小模块码的关键补救)
+                url = decodeQrFromBitmap(bmp, true);
             }
+            return url;
         } catch (Exception ignored) {
             try {
                 reader.reset();
@@ -402,6 +471,97 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
             }
         }
         return null;
+    }
+
+    /** 从一张 Bitmap 解远程链接;enhance=true 时先放大 2 倍(上限 2600px 控内存)再 Otsu 二值化,
+     *  专治"二维码只占画面一部分的整窗截图":真实链接 200+ 字符是高版本密集码,原图模块偏小直解常失败 */
+    private String decodeQrFromBitmap(Bitmap src, boolean enhance) {
+        Bitmap work = src;
+        boolean created = false;
+        try {
+            if (enhance) {
+                int maxDim = Math.max(src.getWidth(), src.getHeight());
+                float f = Math.min(2.0f, 2600f / maxDim);
+                if (f > 1.05f) {
+                    // 最近邻放大(不做平滑插值),保留模块硬边缘;二值化后黑白更锐利
+                    Bitmap scaled = Bitmap.createScaledBitmap(src,
+                            Math.round(src.getWidth() * f), Math.round(src.getHeight() * f), false);
+                    if (scaled != null) {
+                        work = scaled;
+                        created = true;
+                    }
+                }
+            }
+            int w = work.getWidth();
+            int h = work.getHeight();
+            int[] pixels = new int[w * h];
+            work.getPixels(pixels, 0, w, 0, 0, w, h);
+            if (enhance) {
+                int thr = otsuThreshold(pixels);
+                for (int i = 0; i < pixels.length; i++) {
+                    pixels[i] = luminance(pixels[i]) < thr ? 0xFF000000 : 0xFFFFFFFF;
+                }
+            }
+            if (created) {
+                work.recycle();
+                work = src;
+            }
+            RGBLuminanceSource source = new RGBLuminanceSource(w, h, pixels);
+            Result result = decodeWithFallback(source);
+            if (result != null && result.getText() != null) {
+                Matcher m = REMOTE_URL.matcher(result.getText());
+                if (m.find()) {
+                    return m.group();
+                }
+            }
+        } catch (Exception ignored) {
+            try {
+                reader.reset();
+            } catch (Exception ignored2) {
+            }
+        } finally {
+            if (created && work != src) {
+                work.recycle();
+            }
+        }
+        return null;
+    }
+
+    private static int luminance(int rgb) {
+        return (((rgb >> 16) & 0xFF) * 299 + ((rgb >> 8) & 0xFF) * 587 + (rgb & 0xFF) * 114) / 1000;
+    }
+
+    /** Otsu 大津法自动阈值:把灰度直方图分成黑白两类,取类间方差最大的分界(对光照不均比固定 128 稳) */
+    private static int otsuThreshold(int[] pixels) {
+        int[] hist = new int[256];
+        for (int p : pixels) {
+            hist[luminance(p)]++;
+        }
+        int total = pixels.length;
+        int sum = 0;
+        for (int i = 0; i < 256; i++) {
+            sum += i * hist[i];
+        }
+        int sumB = 0, wB = 0, maxVar = 0, threshold = 128;
+        for (int t = 0; t < 256; t++) {
+            wB += hist[t];
+            if (wB == 0) {
+                continue;
+            }
+            int wF = total - wB;
+            if (wF == 0) {
+                break;
+            }
+            sumB += t * hist[t];
+            int mB = sumB / wB;
+            int mF = (sum - sumB) / wF;
+            int d = wB * wF * (mB - mF) * (mB - mF);
+            if (d > maxVar) {
+                maxVar = d;
+                threshold = t;
+            }
+        }
+        return threshold;
     }
 
     private void releaseCamera() {

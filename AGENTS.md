@@ -72,12 +72,20 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - 模拟器 `emu network speed` 限速命令会弄丢 guest 默认路由(ip route 无 default),且重启/wipe 前难恢复 — 测完限速记得恢复;真要限速测下载,优先在真机或抓中间态截图为主(来源:2026-08-21 v1.6 实测)
 - adb 预置 `shared_prefs/MainActivity.xml` 时 URL 里的 `&` 要写成 `&amp;`,否则链接被 XML 截断(来源:模拟器测试实测)
 - Git Bash 里 `adb push/pull/shell <unix路径>`(如 `/sdcard/x`、`/data/data/...`)会被 MSYS 当成 Windows 路径转换成 `D:/Program Files/Git/sdcard/...` 导致失败 — 在命令前加 `MSYS_NO_PATHCONV=1`(如 `MSYS_NO_PATHCONV=1 adb push a.xml /sdcard/a.xml`);`screencap -p <设备路径>` 也会因同样原因报 usage,改用 `adb exec-out screencap -p > 本地.png`;注意该前缀只作用于紧随的一条命令,同一脚本里后续 adb 命令要各自加(来源:2026-09-04 v1.8 模拟器实测,同日补逐命令生效细节)
-- 系统照片选择器(Photo Picker)只认 media store 索引,`adb push` 图片进去后选择器里看不到("No photos or videos")— 必须再执行 `adb shell content call --uri content://media --method scan_file --arg /sdcard/Download/xx.png` 触发入库;扫码相册选图的模拟器测试依赖这一步(来源:2026-09-04 扫码 E2E 实测)
+- 系统照片选择器(Photo Picker)只认 media store 索引,`adb push` 图片进去后选择器里看不到("No photos or videos")— 需两步:`content call --uri content://media --method scan_file --arg /sdcard/Download/xx.png` 入库(建的行默认 is_pending=1,选择器仍不可见),再查 `_id` 后按行 URI 清 pending:`content update --uri content://media/external/images/media/<id> --bind is_pending:i:0`(在集合 URI 上 update 会报 "not part of well-defined collection");扫码相册选图的模拟器测试依赖这套(来源:2026-09-04 扫码 E2E 实测,同日真会话联调补全 pending 细节)
 - `ConnectivityManager.registerNetworkCallback` 需要 `ACCESS_NETWORK_STATE` 权限,没声明会抛 SecurityException;若回调注册处用 try-catch 吞掉异常,会表现为"回调从不触发"且无任何报错日志 — 网络恢复自动重连不工作时先查 Manifest 有没有这个权限(来源:2026-09-04 v1.9 实测)
 - `WebViewClient.ERROR_NETWORK_CHANGED` / `ERROR_INTERNET_DISCONNECTED` 这两个错误码常量在 android.webkit.WebViewClient 里并不存在(写了会编译报错);断网判据用 ERROR_HOST_LOOKUP / ERROR_CONNECT / ERROR_TIMEOUT 即可(来源:2026-09-04 v1.9 编译实测)
 - "清除网页数据"只调 `clearCache`+`removeAllCookies` 清不掉 localStorage/IndexedDB — 远程网页的会话/relay 登录态存在 DOM storage 里,必须额外 `WebStorage.getInstance().deleteAllData()`(WebSettings 开了 domStorage/database);另配 `WebViewDatabase.clearHttpAuthUsernamePassword()` 清表单/HTTP 认证(来源:2026-09-04 v1.9)
 - 更新包下载默认走 `DL_MIRRORS` 里的 ghproxy 式加速前缀(把完整 GitHub 下载 URL 拼在代理域名后面),失败/20 秒无字节增长自动换源,镜像用尽→官方源→再补一轮才报最终失败 — 这类免费公共代理可用性会变,发现某节点长期 000/404 就从 `DL_MIRRORS` 换掉;新代理先 `curl -r 0-3` 拉头几字节验证:206 + PK 头(`504b0304`)+ `application/vnd.android.package-archive` 才算真能流出 APK(HEAD 200 可能是假象)(来源:2026-09-04 v2.0 模拟器端到端实测)
 - 镜像可用性因网络而异,用户真机反馈是最好依据:2026-09-04 用户实测 `gh-proxy.com`(加速源)可正常下载,已调到 `DL_MIRRORS` 第一位;同日宿主机 curl 实测 `mirror.ghproxy.com`/`ghproxy.cc` 已失效,未收录(来源:2026-09-04 v2.2)
+- **第三方加速代理下载的 APK 必须验签后才装**:HTTPS 只保证到代理的链路,代理返回什么内容完全由它决定(可投毒/返回错误页)。下载完成用 `getPackageArchiveInfo(path, GET_SIGNING_CERTIFICATES)` 校验 ①包名==本应用 ②versionCode 更高 ③签名集合(SDK28+ `signingInfo.getApkContentsSigners()`,老版本 `GET_SIGNATURES`/`info.signatures`)与已装本应用逐字节一致。文件不是有效 APK(archiveInfo==null)→ 换下一个源重试;签名/包名不符 → 直接阻断弹窗(所有镜像服务同一个 GitHub 文件,换源无意义)(来源:2026-09-05 v2.3)
+- zxing 解码 QR **无需旋转相机预览帧**:QR 有三个定位符,原生支持任意朝向,直接把 NV21 的 Y 平面按原宽高喂 `PlanarYUVLuminanceSource` 即可(JVM 实测 0/90/180/270° 全 PASS);每帧旋转 w*h 像素是纯浪费还多一次整块分配。HybridBinarizer 解不出时用 GlobalHistogramBinarizer 兜底,暗光/低对比度/相册选图成功率更高(来源:2026-09-05 v2.3 JVM 验证)
+- **相册选图解高版本密集 QR 必须放大+二值化**:真实远程链接 200+ 字符(sid+hash+mid+name),QR 是高版本密集码;用户从相册选的常是"二维码只占画面一小块的整窗截图",模块偏小,**原图直接解(两种 Binarizer 都试)必然失败,JVM 实测放大 1.5x 也失败,2x + Otsu 大津法二值化才成功**(最近邻放大保模块硬边缘,别用平滑插值)。相册路径原图失败后要追加一轮 2x 放大(上限 2600px 控内存)+ Otsu 阈值重试;相机预览是连续帧、模块够大且要实时,不用这套(来源:2026-09-05 v2.3 真实截图 E2E 验证)
+- `exported="false"` 的 Activity(如 ScanActivity)用 `adb shell am start -n .../.ScanActivity` 拉不起(SecurityException: not exported),视觉审查这类页面必须从 App 内按钮点进去(来源:2026-09-05 v2.3 模拟器实测)
+- AlertDialog 系统控件着色:按钮文字取主题 `colorAccent`,Switch/复选框选中态取 `colorControlActivated`;统一成 App 蓝(`#4C8DFF`)两个 item 都得在 styles.xml 设,只设一个开关仍是系统默认青绿(来源:2026-09-05 v2.3)
+- 版本号别在 Java 里维护常量:运行时 `PackageManager.getPackageInfo(pkg,0).versionName` 取,gradle 的 versionName 作唯一来源,否则发版要在代码和 gradle 两处人肉同步、易漏(来源:2026-09-05 v2.3)
+- WebView `destroy()` 前先 `((ViewGroup)webView.getParent()).removeView(webView)`:destroy 只清原生资源,仍挂视图树的 WebView 之后收布局/绘制事件会打已销毁内核,偶发崩溃(来源:2026-09-05 v2.3)
+- SharedPreferences 里的远程链接带 sid(=控制电脑的凭证),`allowBackup` 必须 false 并配 `res/xml/data_extraction_rules.xml` 禁云备份+设备迁移,否则 sid 随 Google 备份/adb backup 外泄(来源:2026-09-05 v2.3)
 
 ## 知识沉淀协议
 

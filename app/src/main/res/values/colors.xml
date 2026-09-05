@@ -2,4 +2,6 @@
 <resources>
     <color name="ic_launcher_background">#1B5BD7</color>
     <color name="bg">#0F1014</color>
+    <!-- 主题 accent:统一对话框按钮/Switch/复选框等系统控件为 App 蓝,否则走系统默认青绿 -->
+    <color name="accent">#4C8DFF</color>
 </resources>

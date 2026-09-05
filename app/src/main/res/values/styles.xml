@@ -5,5 +5,9 @@
         <item name="android:statusBarColor">@color/bg</item>
         <item name="android:navigationBarColor">@color/bg</item>
         <item name="android:windowLightStatusBar">false</item>
+        <!-- 对话框按钮、Switch、单选复选框等系统控件的强调色,统一成 App 蓝(否则是系统默认青绿)。
+             按钮文字/复选框取 colorAccent,Switch 选中态取 colorControlActivated,两个都要设 -->
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorControlActivated">@color/accent</item>
     </style>
 </resources>

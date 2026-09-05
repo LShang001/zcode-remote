@@ -71,15 +71,17 @@ EOF'
 
 ```bash
 # 1. 用项目 zxing core jar 生成二维码图(gradle 缓存里取 core-x.x.jar,QRCodeWriter 编码 URL)
-# 2. 推图并入库——照片选择器只认 media store,推送后必须 scan_file,否则选择器里看不到:
+# 2. 推图并入库——照片选择器只认 media store,且 shell scan_file 建的行 is_pending=1 仍不可见,必须清 pending:
 MSYS_NO_PATHCONV=1 "$ADB" push qr-remote.png /sdcard/Download/qr-remote.png
 MSYS_NO_PATHCONV=1 "$ADB" shell content call --uri content://media --method scan_file --arg /sdcard/Download/qr-remote.png
+ID=$("$ADB" shell content query --uri content://media/external/images/media --projection _id | head -1 | grep -o '_id=[0-9]*' | cut -d= -f2)
+MSYS_NO_PATHCONV=1 "$ADB" shell content update --uri "content://media/external/images/media/$ID" --bind is_pending:i:0
 # 3. 相机权限预授权,免弹窗打断:
 "$ADB" shell pm grant com.zcode.remote android.permission.CAMERA
 # 4. UI 驱动:设置页 →「扫码绑定」→「相册选图」→ 选中二维码图
 ```
 
-判定:WebView 加载回传的链接即全链通过;假 sid 链接会 404 → 壳错误页"会话链接已失效(HTTP 404)"出现,顺带验证了壳的 404 检测。注意壳自绘错误页上**不显示悬浮钮**(设计行为:网页内容态才有),别当成大屏回归 bug。
+判定:WebView 加载回传的链接即全链通过。用桌面端真实二维码时(截图给 zxing 解码出 URL → QrGen 重生成干净码),能连出真实远程控制页("已连接到当前桌面窗口",列出工作区/任务);桌面端已有手机连接时第二个客户端仍可接入。注意壳自绘错误页上**不显示悬浮钮**(设计行为:网页内容态才有),别当成大屏回归 bug。
 
 ## 断网→重连(2026-09-04 实测通过)
 

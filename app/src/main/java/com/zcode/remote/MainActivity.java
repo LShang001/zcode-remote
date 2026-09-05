@@ -10,6 +10,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.content.res.ColorStateList;
 import android.database.Cursor;
 import android.graphics.drawable.GradientDrawable;
@@ -26,6 +29,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
+import android.webkit.PermissionRequest;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -47,6 +51,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -55,7 +60,9 @@ import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import android.Manifest;
 import android.content.pm.ApplicationInfo;
@@ -77,7 +84,6 @@ public class MainActivity extends Activity {
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
-    private static final String APP_VERSION = "2.2";
     static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
     private static final String KEY_HISTORY = "history_urls";
     private static final int MAX_HISTORY = 8;
@@ -126,6 +132,15 @@ public class MainActivity extends Activity {
     private long lastBackTime = 0L;
     private ConnectivityManager.NetworkCallback networkCallback;
     private boolean onErrorPage = false;
+    // 是否在前台:剪贴板监听只在前台响应;版本/签名缓存
+    private boolean inForeground = false;
+    private ClipboardManager.OnPrimaryClipChangedListener clipListener;
+    // 上次已处理过的剪贴板时间戳:内容没变就不重复读取(Android 12+ 读取他应用剪贴板会弹系统提示)
+    private long lastClipTimestamp = -1L;
+    private String appVersionCache;
+    private Signature[] ownSignatures;
+    // 下载完成但缺"安装未知应用"权限时,暂存下载 id;授权回前台后续装(文件还在,不用重新下载)
+    private long pendingInstallDownloadId = -1L;
     // 更新下载源切换状态:-1..N-2 为 DL_MIRRORS 下标,N-1 表示官方源;-1 表示尚未开始
     private int dlSourceIndex = -1;
     private int dlRound = 0;
@@ -154,7 +169,7 @@ public class MainActivity extends Activity {
                 if (status == DownloadManager.STATUS_SUCCESSFUL) {
                     long id = pendingDownloadId;
                     pendingDownloadId = -1L;
-                    installApk(id);
+                    verifyAndInstall(id);
                     return;
                 }
                 if (status == DownloadManager.STATUS_FAILED) {
@@ -168,10 +183,14 @@ public class MainActivity extends Activity {
                     updateText.setText(pct + "% · " + formatSize(done) + " / "
                             + (total > 0 ? formatSize(total) : "?") + extra + " · " + dlSourceLabel());
                 }
-                // 卡住检测:RUNNING 但字节数长时间不增长(代理挂起/0 字节),超时自动换下一个源
+                // 卡住检测:仅 RUNNING 状态下字节长时间不增长才算(代理挂起/0 字节);
+                // PAUSED(等待网络/Wi-Fi 切换恢复)是系统调度,不计超时,否则弱网会无谓轮换所有源
                 long now = System.currentTimeMillis();
                 if (done > dlLastBytes) {
                     dlLastBytes = done;
+                    dlLastProgressAt = now;
+                } else if (status == DownloadManager.STATUS_PAUSED) {
+                    // 系统暂停(等网络/切 Wi-Fi)期间持续刷新计时,恢复 RUNNING 后不会立刻误判超时
                     dlLastProgressAt = now;
                 } else if (status == DownloadManager.STATUS_RUNNING
                         && now - dlLastProgressAt > DL_STALL_TIMEOUT_MS) {
@@ -195,9 +214,10 @@ public class MainActivity extends Activity {
         @Override
         public void onReceive(Context context, Intent intent) {
             long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
+            // 与 progressPoller 同为主线程串行:谁先处理谁把 pendingDownloadId 置 -1,另一个自然跳过
             if (id == pendingDownloadId) {
                 pendingDownloadId = -1L;
-                installApk(id);
+                verifyAndInstall(id);
             }
         }
     };
@@ -217,6 +237,7 @@ public class MainActivity extends Activity {
             registerReceiver(downloadDone, doneFilter);
         }
         registerNetworkCallback();
+        registerClipboardListener();
         maybeRequestNotificationPermission();
         root = new FrameLayout(this);
         root.setBackgroundColor(BG);
@@ -228,6 +249,49 @@ public class MainActivity extends Activity {
                 && System.currentTimeMillis() - sp.getLong(KEY_LAST_UPDATE_CHECK, 0L) >= UPDATE_CHECK_INTERVAL_MS) {
             checkUpdate(false);
         }
+    }
+
+    /** 版本号单一来源:运行时读 PackageInfo,菜单/关于/更新比较都用它,避免与 build.gradle 双写漏改 */
+    private String appVersion() {
+        if (appVersionCache == null) {
+            try {
+                appVersionCache = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            } catch (Exception e) {
+                appVersionCache = "0";
+            }
+        }
+        return appVersionCache;
+    }
+
+    private long appVersionCode() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : (long) info.versionCode;
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+    /**
+     * 剪贴板监听:App 在前台时剪贴板一变化就尝试采纳远程链接。
+     * 相比每次 onResume 轮询,只在内容真正变化时读一次,减少 Android 12+ 的"已粘贴自…"系统提示频次。
+     */
+    private void registerClipboardListener() {
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm == null) {
+            return;
+        }
+        clipListener = new ClipboardManager.OnPrimaryClipChangedListener() {
+            @Override
+            public void onPrimaryClipChanged() {
+                // 前台时剪贴板刚被写入:同步时间戳(只读描述不触发系统提示),内容与已保存不同才采纳
+                if (inForeground) {
+                    lastClipTimestamp = clipboardTimestamp();
+                    switchToClipboardUrl();
+                }
+            }
+        };
+        cm.addPrimaryClipChangedListener(clipListener);
     }
 
     /** Android 13+ 下载/更新通知需要运行时申请 POST_NOTIFICATIONS,否则通知静默不显示 */
@@ -277,7 +341,36 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        switchToClipboardUrl();
+        inForeground = true;
+        // 回前台时若剪贴板时间戳变了才读一次(复制发生在其他 App 时 listener 收不到变化,
+        // 必须回前台补检;时间戳没变说明同一份内容已处理过,跳过以避免反复触发系统"已粘贴自"提示)
+        long ts = clipboardTimestamp();
+        if (ts != lastClipTimestamp) {
+            lastClipTimestamp = ts;
+            switchToClipboardUrl();
+        }
+        // 从"安装未知应用"授权设置回来:已有验签通过的包就直接续装
+        maybeResumeInstallAfterPermission();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        inForeground = false;
+    }
+
+    /** 读取剪贴板时间戳(不读内容,不触发 Android 12+ 系统提示);拿不到时返回 -1 */
+    private long clipboardTimestamp() {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) {
+                return -1L;
+            }
+            return cm.getPrimaryClipDescription() != null
+                    ? cm.getPrimaryClipDescription().getTimestamp() : -1L;
+        } catch (Exception e) {
+            return -1L;
+        }
     }
 
     private void route(Intent intent) {
@@ -557,8 +650,46 @@ public class MainActivity extends Activity {
     private void destroyWeb() {
         if (webView != null) {
             webView.stopLoading();
+            // 先从父容器摘除再 destroy:destroy() 只做原生资源清理,仍挂在视图树上的 WebView
+            // 之后收到布局/绘制事件会打到已销毁的内核,偶发崩溃
+            if (webView.getParent() instanceof ViewGroup) {
+                ((ViewGroup) webView.getParent()).removeView(webView);
+            }
             webView.destroy();
             webView = null;
+        }
+        progress = null;
+        fab = null;
+    }
+
+    /** 打开站外链接:http(s)/mailto/tel 直接交给系统;intent:// 用 parseUri 解析(网页跳 App 的标准写法),
+     *  目标 App 不存在时按网页给的 browser_fallback_url 兜底,避免链接静默失效 */
+    private void openExternal(Uri uri) {
+        try {
+            if ("intent".equals(uri.getScheme())) {
+                Intent intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME);
+                try {
+                    startActivity(intent);
+                    return;
+                } catch (Exception e) {
+                    String fallback = intent.getStringExtra("browser_fallback_url");
+                    if (fallback != null) {
+                        startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(fallback)));
+                        return;
+                    }
+                    if (intent.getPackage() != null) {
+                        try {
+                            startActivity(new Intent(Intent.ACTION_VIEW,
+                                    Uri.parse("market://details?id=" + intent.getPackage())));
+                            return;
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+            } else {
+                startActivity(new Intent(Intent.ACTION_VIEW, uri));
+            }
+        } catch (Exception ignored) {
         }
     }
 
@@ -589,10 +720,7 @@ public class MainActivity extends Activity {
                         && (host.equals(allowedHost) || host.endsWith("." + allowedHost))) {
                     return false;
                 }
-                try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, uri));
-                } catch (Exception ignored) {
-                }
+                openExternal(uri);
                 return true;
             }
 
@@ -658,6 +786,32 @@ public class MainActivity extends Activity {
                     return false;
                 }
                 return true;
+            }
+
+            @Override
+            public void onPermissionRequest(final PermissionRequest request) {
+                // 远程网页可能请求麦克风/摄像头(语音/视频类功能):有对应系统权限就授予,没有则拒绝。
+                // 不主动申请权限——保持壳的本分,需要的用户在系统设置里给过即生效
+                runOnUiThread(() -> {
+                    String[] wanted = request.getResources();
+                    List<String> grant = new ArrayList<>();
+                    for (String res : wanted) {
+                        if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(res)
+                                && checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                                == PackageManager.PERMISSION_GRANTED) {
+                            grant.add(res);
+                        } else if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(res)
+                                && checkSelfPermission(Manifest.permission.CAMERA)
+                                == PackageManager.PERMISSION_GRANTED) {
+                            grant.add(res);
+                        }
+                    }
+                    if (grant.isEmpty()) {
+                        request.deny();
+                    } else {
+                        request.grant(grant.toArray(new String[0]));
+                    }
+                });
             }
         });
 
@@ -792,7 +946,7 @@ public class MainActivity extends Activity {
         box.setOrientation(LinearLayout.VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("ZCode Remote · v" + APP_VERSION);
+        title.setText("ZCode Remote · v" + appVersion());
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
         title.setTextColor(FG);
         title.setPadding(0, 0, 0, dp(4));
@@ -860,7 +1014,7 @@ public class MainActivity extends Activity {
         box.addView(panelRow("ⓘ", "关于本应用", "版本信息与使用说明", v -> showAbout(url)));
 
         TextView footer = new TextView(this);
-        footer.setText("ZCode Remote v" + APP_VERSION + " · 网页的独立窗口封装");
+        footer.setText("ZCode Remote v" + appVersion() + " · 网页的独立窗口封装");
         footer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         footer.setTextColor(FG_DIM);
         footer.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -1001,7 +1155,7 @@ public class MainActivity extends Activity {
     private void showAbout(String url) {
         new AlertDialog.Builder(this)
                 .setTitle("关于 ZCode Remote")
-                .setMessage("版本:v" + APP_VERSION
+                .setMessage("版本:v" + appVersion()
                         + "\n\n当前会话:\n" + (url.isEmpty() ? "(未设置)" : url)
                         + "\n\n说明:\n把 ZCode 桌面端的远程控制网页封装成独立 App,只做装载与移动体验增强,网页功能归 ZCode 官方。")
                 .setPositiveButton("关闭", null)
@@ -1107,9 +1261,17 @@ public class MainActivity extends Activity {
                 Toast.makeText(this, "链接格式不对,应以 https:// 开头", Toast.LENGTH_LONG).show();
                 return;
             }
-            getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_URL, url).apply();
-            recordHistory(url);
-            showWeb(url);
+            if (!REMOTE_URL.matcher(url).find()) {
+                // 不阻拦任何链接(保持壳的通用性),但非 ZCode 远程地址时二次确认,防手滑粘错
+                new AlertDialog.Builder(this)
+                        .setTitle("这似乎不是 ZCode 远程链接")
+                        .setMessage("粘贴的内容不是以 https://zcode.z.ai/remote 开头的地址,确定要保存并打开它吗?")
+                        .setPositiveButton("仍然打开", (d, w) -> saveAndOpen(url))
+                        .setNegativeButton("再看看", null)
+                        .show();
+                return;
+            }
+            saveAndOpen(url);
         });
 
         Button paste = new Button(this);
@@ -1161,7 +1323,7 @@ public class MainActivity extends Activity {
         }
 
         TextView footer = new TextView(this);
-        footer.setText("v" + APP_VERSION + " · ZCode 网页的独立窗口封装");
+        footer.setText("v" + appVersion() + " · ZCode 网页的独立窗口封装");
         footer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         footer.setTextColor(FG_DIM);
         footer.setPadding(0, dp(28), 0, 0);
@@ -1169,6 +1331,13 @@ public class MainActivity extends Activity {
 
         root.removeAllViews();
         root.addView(scrollWrap(box), contentLp());
+    }
+
+    /** 设置页确认后的统一保存入口:存偏好、记历史、打开 */
+    private void saveAndOpen(String url) {
+        getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_URL, url).apply();
+        recordHistory(url);
+        showWeb(url);
     }
 
     /** 设置/错误页容器:竖屏占满,横屏与平板限宽居中,内容超高可滚动 */
@@ -1272,10 +1441,10 @@ public class MainActivity extends Activity {
             final String v = version;
             final String url = apkUrl;
             runOnUiThread(() -> {
-                if (v != null && url != null && versionNewer(v, APP_VERSION)) {
+                if (v != null && url != null && versionNewer(v, appVersion())) {
                     offerUpdate(v, url);
                 } else if (manual) {
-                    toast(v == null ? "检查更新失败,请稍后再试" : "已是最新版本 v" + APP_VERSION);
+                    toast(v == null ? "检查更新失败,请稍后再试" : "已是最新版本 v" + appVersion());
                 }
             });
         }).start();
@@ -1469,28 +1638,156 @@ public class MainActivity extends Activity {
         return b + " B";
     }
 
-    private void installApk(long downloadId) {
+    /**
+     * 下载完成后的安装入口:先验签再安装。第三方加速镜像是不可信通道(HTTPS 只保证到代理的链路,
+     * 代理返回什么内容完全由它决定),必须确认下载的 APK 包名一致、版本更高、签名与已装本应用完全相同,
+     * 才拉起安装器;任一不符都删文件并报错,挡住镜像投毒/返回错误内容。
+     */
+    private void verifyAndInstall(long downloadId) {
         dismissUpdateDialog();
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        String path = null;
+        try {
+            Cursor c = dm.query(new DownloadManager.Query().setFilterById(downloadId));
+            if (c != null) {
+                try {
+                    if (c.moveToFirst()) {
+                        int idx = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_FILENAME);
+                        if (idx >= 0) {
+                            path = c.getString(idx);
+                        }
+                    }
+                } finally {
+                    c.close();
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        if (path == null) {
+            // 连文件都找不到,当本源失败处理,轮换下一个下载源
+            failDownload();
+            return;
+        }
+        String error = verifyApk(path);
+        if (error == null) {
+            proceedToInstall(downloadId);
+            return;
+        }
+        try {
+            new File(path).delete();
+        } catch (Exception ignored) {
+        }
+        if (error.startsWith(NOT_VALID_APK)) {
+            // 文件根本不是有效 APK(代理返回错误页/垃圾内容):本源不可用,failDownload 会换下一个源
+            failDownload();
+            return;
+        }
+        // 包名/版本/签名不符:所有镜像服务的是同一个 GitHub 文件,换源无意义,直接阻断
+        new AlertDialog.Builder(this)
+                .setTitle("更新包校验失败,已阻止安装")
+                .setMessage("下载的安装包" + error + ",文件已删除。\n\n这可能是下载源内容被篡改,请不要安装;可稍后重试,或在电脑端下载后传到手机安装。")
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
+    private static final String NOT_VALID_APK = "NOT_VALID_APK";
+
+    /** 校验下载的 APK:包名/版本/签名,全部通过返回 null;文件不是有效 APK 返回 NOT_VALID_APK 前缀(可换源);
+     *  其余为内容不符(包名/版本/签名),返回中文原因(应阻断) */
+    private String verifyApk(String path) {
+        try {
+            PackageManager pm = getPackageManager();
+            int flags = Build.VERSION.SDK_INT >= 28
+                    ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
+            PackageInfo info = pm.getPackageArchiveInfo(path, flags);
+            if (info == null) {
+                return NOT_VALID_APK;
+            }
+            if (!getPackageName().equals(info.packageName)) {
+                return "包名不一致(实际为 " + info.packageName + ")";
+            }
+            long remoteVc = Build.VERSION.SDK_INT >= 28
+                    ? info.getLongVersionCode() : (long) info.versionCode;
+            if (remoteVc <= appVersionCode()) {
+                return "版本不高于当前已安装版本";
+            }
+            Signature[] got = Build.VERSION.SDK_INT >= 28 && info.signingInfo != null
+                    ? info.signingInfo.getApkContentsSigners() : info.signatures;
+            if (!sameSignatures(got, ownSignatures())) {
+                return "签名与已安装版本不一致";
+            }
+            return null;
+        } catch (Exception e) {
+            // 解析过程出错(文件损坏等):按无效包处理,换源重试
+            return NOT_VALID_APK;
+        }
+    }
+
+    private Signature[] ownSignatures() {
+        if (ownSignatures == null) {
+            try {
+                int flags = Build.VERSION.SDK_INT >= 28
+                        ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
+                PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), flags);
+                ownSignatures = Build.VERSION.SDK_INT >= 28 && info.signingInfo != null
+                        ? info.signingInfo.getApkContentsSigners() : info.signatures;
+            } catch (Exception e) {
+                ownSignatures = new Signature[0];
+            }
+        }
+        return ownSignatures;
+    }
+
+    /** 签名集合比对(debug 包只有一个签名;用集合比较兼容多签名/v2 签名方案) */
+    private boolean sameSignatures(Signature[] a, Signature[] b) {
+        if (a == null || b == null || a.length == 0 || a.length != b.length) {
+            return false;
+        }
+        Set<String> set = new HashSet<>();
+        for (Signature s : a) {
+            set.add(s.toCharsString());
+        }
+        for (Signature s : b) {
+            if (!set.contains(s.toCharsString())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 验签通过:有安装权限直接装;没有就先引导授权,文件留着,授权回前台后续装(不再重新下载) */
+    private void proceedToInstall(long downloadId) {
         if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            pendingInstallDownloadId = downloadId;
             new AlertDialog.Builder(this)
                     .setTitle("需要安装权限")
-                    .setMessage("安装更新前需允许本应用\"安装未知应用\"(只需授权一次)。\n\n授权后回到本 App,重新点\"检查更新\"即可继续完成安装。")
+                    .setMessage("安装更新前需允许本应用\"安装未知应用\"(只需授权一次)。\n\n授权后回到本 App 会自动继续安装,无需重新下载。")
                     .setPositiveButton("去授权", (d, w) -> {
                         try {
                             startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                                     Uri.parse("package:" + getPackageName())));
                         } catch (Exception e) {
+                            pendingInstallDownloadId = -1L;
                             toast("无法打开授权设置");
                         }
                     })
-                    .setNegativeButton("以后再说", null)
+                    .setNegativeButton("以后再说", (d, w) -> pendingInstallDownloadId = -1L)
+                    .setOnCancelListener(d -> pendingInstallDownloadId = -1L)
                     .show();
             return;
         }
+        launchInstaller(downloadId);
+    }
+
+    private void launchInstaller(long downloadId) {
         DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
         Uri uri = dm.getUriForDownloadedFile(downloadId);
         if (uri == null) {
-            failDownload();
+            new AlertDialog.Builder(this)
+                    .setTitle("安装失败")
+                    .setMessage("安装包文件已不存在(可能被系统清理),请重新检查更新下载。")
+                    .setPositiveButton("知道了", null)
+                    .show();
             return;
         }
         Intent intent = new Intent(Intent.ACTION_VIEW);
@@ -1501,6 +1798,20 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             toast("无法启动安装界面");
         }
+    }
+
+    /** 从"安装未知应用"授权设置回到前台:权限已给且有待装包,直接续装 */
+    private void maybeResumeInstallAfterPermission() {
+        if (pendingInstallDownloadId < 0) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            return;
+        }
+        long id = pendingInstallDownloadId;
+        pendingInstallDownloadId = -1L;
+        toast("已获得安装权限,继续安装…");
+        launchInstaller(id);
     }
 
     private void toast(String msg) {
@@ -1564,6 +1875,16 @@ public class MainActivity extends Activity {
         try {
             unregisterReceiver(downloadDone);
         } catch (Exception ignored) {
+        }
+        if (clipListener != null) {
+            try {
+                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                if (cm != null) {
+                    cm.removePrimaryClipChangedListener(clipListener);
+                }
+            } catch (Exception ignored) {
+            }
+            clipListener = null;
         }
         if (networkCallback != null) {
             try {
