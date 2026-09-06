@@ -102,7 +102,8 @@ public class MainActivity extends Activity {
             "https://gh.llkk.cc/",
             "https://ghproxy.net/"
     };
-    private static final long DL_STALL_TIMEOUT_MS = 20_000L; // 下载卡住(无字节增长)判定阈值,超时切换下一源
+    // 下载卡住(无字节增长)判定阈值:代理回源慢/弱网抖动 20s+ 很常见,误杀会整轮换源重下,代价远大于多等
+    private static final long DL_STALL_TIMEOUT_MS = 60_000L;
     private static final int BG = 0xFF0F1014;
     private static final int FG = 0xFFEDEEF0;
     private static final int FG_DIM = 0xFF9AA0A6;
@@ -190,14 +191,15 @@ public class MainActivity extends Activity {
                     updateText.setText(pct + "% · " + formatSize(done) + " / "
                             + (total > 0 ? formatSize(total) : "?") + extra + " · " + dlSourceLabel());
                 }
-                // 卡住检测:仅 RUNNING 状态下字节长时间不增长才算(代理挂起/0 字节);
-                // PAUSED(等待网络/Wi-Fi 切换恢复)是系统调度,不计超时,否则弱网会无谓轮换所有源
+                // 卡住检测:仅 RUNNING 状态下字节长时间不增长才算(代理挂起/0 字节)。
+                // PENDING(排队)/PAUSED(等网络/切 Wi-Fi/代理解析)是系统调度,字节必然不动,
+                // 必须持续刷新计时戳:否则"等待时长"会累进 RUNNING 的卡住判定,刚恢复就被误杀
                 long now = System.currentTimeMillis();
                 if (done > dlLastBytes) {
                     dlLastBytes = done;
                     dlLastProgressAt = now;
-                } else if (status == DownloadManager.STATUS_PAUSED) {
-                    // 系统暂停(等网络/切 Wi-Fi)期间持续刷新计时,恢复 RUNNING 后不会立刻误判超时
+                } else if (status == DownloadManager.STATUS_PENDING
+                        || status == DownloadManager.STATUS_PAUSED) {
                     dlLastProgressAt = now;
                 } else if (status == DownloadManager.STATUS_RUNNING
                         && now - dlLastProgressAt > DL_STALL_TIMEOUT_MS) {
