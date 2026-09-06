@@ -88,6 +88,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - SharedPreferences 里的远程链接带 sid(=控制电脑的凭证),`allowBackup` 必须 false 并配 `res/xml/data_extraction_rules.xml` 禁云备份+设备迁移,否则 sid 随 Google 备份/adb backup 外泄(来源:2026-09-05 v2.3)
 - **宿主机开代理(Clash 类 fake-ip)时,模拟器造不出传输层网络失败**:`nonexistent.invalid` 会"解析成功"到 198.18.0.x 且 ping 通,坏端口也被代理接管,WebView 卡握手等超时,壳错误页迟迟不出——emulator-review 里"预置死链看错误页"的方法在此环境下失效。**测壳错误页/自动重连用断网法**:`svc wifi disable; svc data disable` 秒出错误覆盖层,`svc … enable` 触发恢复重连;`sid=乱写` 走的是官方页自己的 HTTP200 错误 UI,壳不干预(来源:2026-09-06 v2.4 模拟器实测)
 - 模拟器自动化点菜单/对话框**一律 `uiautomator dump` 查 bounds 取中心,不要硬编码坐标**:菜单头部"当前会话"显示的 URL 长度会改变菜单高度(真实链接 208 字符让菜单项整体下移约 120px,旧坐标会点错项);另外 uiautomator dump 抓不到 Toast(独立窗口不在 view 树),验证这类提示要看副作用而非找文字(来源:2026-09-06 v2.4)
+- 更新下载的 stall(卡住)判定:**DownloadManager 的 PENDING/PAUSED 都是"字节必然不动的调度态",必须持续刷新计时戳**,否则等待时长被累进 RUNNING 的卡住判定,刚恢复传输就被误杀换源(v2.4"每个源下载一半即失败"就是这个+20s 阈值太激进,匀速下载 20s≈一半进度;现 60s,来源:2026-09-06 v2.5)
+- 判定下载"误杀 vs 真断流"看失败耗时:远小于 stall 阈值就失败 = `STATUS_FAILED` 真断流(换源是正确行为);固定进度点失败且该点≈代理缓冲区大小(如 67KB/20%) = 代理流断。**模拟器(宿主代理 fake-ip)下镜像必真断流,端到端下载验证只能真机做**,模拟器只验证"检查更新→弹窗→发起下载→状态机轮换";验证新下载逻辑可用"伪装版本号"法:sed 临时调低 versionName 构建含修复的包装模拟器,让真 latest 触发更新(测完立即恢复版本号重建)(来源:2026-09-06 v2.5)
 
 ## 知识沉淀协议
 
