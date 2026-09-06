@@ -2,4 +2,6 @@
 <resources>
     <string name="sc_change">更换链接</string>
     <string name="sc_change_long">更换远程会话链接</string>
+    <string name="sc_scan">扫码绑定</string>
+    <string name="sc_scan_long">扫码绑定远程会话</string>
 </resources>

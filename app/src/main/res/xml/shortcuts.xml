@@ -11,4 +11,15 @@
             android:targetPackage="com.zcode.remote"
             android:targetClass="com.zcode.remote.MainActivity" />
     </shortcut>
+    <shortcut
+        android:shortcutId="scan_bind"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/sc_scan"
+        android:shortcutLongLabel="@string/sc_scan_long">
+        <intent
+            android:action="com.zcode.remote.SCAN_BIND"
+            android:targetPackage="com.zcode.remote"
+            android:targetClass="com.zcode.remote.MainActivity" />
+    </shortcut>
 </shortcuts>

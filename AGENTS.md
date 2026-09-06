@@ -37,7 +37,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 
 | 路径 | 为什么必须知道 |
 |------|---------------|
-| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、更新、历史会话等逻辑与 UI 都在这(约 1400 行),纯代码布局,不存在 layout XML |
+| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、更新、历史会话等逻辑与 UI 都在这(约 2000 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页 |
 | `app/src/main/java/com/zcode/remote/ScanActivity.java` | 扫码绑定页:Camera1 预览 + zxing core 解码,识别远程二维码回传链接给 MainActivity |
 | `gradle.properties` | `android.overridePathCheck=true` 支撑着中文路径构建,删了构建必挂 |
 | `docs/screenshots/` | v1.1 五张视觉基准图;改 UI 后逐张对照,防回归 |
@@ -86,6 +86,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - 版本号别在 Java 里维护常量:运行时 `PackageManager.getPackageInfo(pkg,0).versionName` 取,gradle 的 versionName 作唯一来源,否则发版要在代码和 gradle 两处人肉同步、易漏(来源:2026-09-05 v2.3)
 - WebView `destroy()` 前先 `((ViewGroup)webView.getParent()).removeView(webView)`:destroy 只清原生资源,仍挂视图树的 WebView 之后收布局/绘制事件会打已销毁内核,偶发崩溃(来源:2026-09-05 v2.3)
 - SharedPreferences 里的远程链接带 sid(=控制电脑的凭证),`allowBackup` 必须 false 并配 `res/xml/data_extraction_rules.xml` 禁云备份+设备迁移,否则 sid 随 Google 备份/adb backup 外泄(来源:2026-09-05 v2.3)
+- **宿主机开代理(Clash 类 fake-ip)时,模拟器造不出传输层网络失败**:`nonexistent.invalid` 会"解析成功"到 198.18.0.x 且 ping 通,坏端口也被代理接管,WebView 卡握手等超时,壳错误页迟迟不出——emulator-review 里"预置死链看错误页"的方法在此环境下失效。**测壳错误页/自动重连用断网法**:`svc wifi disable; svc data disable` 秒出错误覆盖层,`svc … enable` 触发恢复重连;`sid=乱写` 走的是官方页自己的 HTTP200 错误 UI,壳不干预(来源:2026-09-06 v2.4 模拟器实测)
+- 模拟器自动化点菜单/对话框**一律 `uiautomator dump` 查 bounds 取中心,不要硬编码坐标**:菜单头部"当前会话"显示的 URL 长度会改变菜单高度(真实链接 208 字符让菜单项整体下移约 120px,旧坐标会点错项);另外 uiautomator dump 抓不到 Toast(独立窗口不在 view 树),验证这类提示要看副作用而非找文字(来源:2026-09-06 v2.4)
 
 ## 知识沉淀协议
 

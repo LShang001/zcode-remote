@@ -82,6 +82,7 @@ public class MainActivity extends Activity {
     private static final String KEY_SHOW_FAB = "show_fab";
     private static final String KEY_AUTO_UPDATE = "auto_update";
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
+    private static final String ACTION_SCAN_BIND = "com.zcode.remote.SCAN_BIND";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
     static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
@@ -116,6 +117,12 @@ public class MainActivity extends Activity {
     private FrameLayout root;
     private WebView webView;
     private ProgressBar progress;
+    // 会话层(WebView+进度条+悬浮钮的常驻容器):设置/错误页以覆盖层叠在其上,
+    // 返回会话只移除覆盖层,网页不重载、滚动位置与页面状态全保留("会话秒回")
+    private RefreshLayout sessionView;
+    private View overlayView;
+    // WebView 内容是否处于加载失败态:失败后"返回会话"要 reload 而不是只掀掉覆盖层(否则露出内核错误白页)
+    private boolean webLoadFailed = false;
     private ValueCallback<Uri[]> fileCallback;
     private String allowedHost;
     private String loadedUrl;
@@ -320,7 +327,15 @@ public class MainActivity extends Activity {
                             String url = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
                             if (url != null) {
                                 Toast.makeText(MainActivity.this, "网络已恢复,正在重连…", Toast.LENGTH_SHORT).show();
-                                showWeb(url);
+                                onErrorPage = false;
+                                webLoadFailed = false;
+                                removeOverlay();
+                                if (webView != null) {
+                                    // 会话层还在:原样 reload(页面处于加载失败态,必须重载)
+                                    webView.reload();
+                                } else {
+                                    showWeb(url);
+                                }
                             }
                         }
                     });
@@ -375,6 +390,8 @@ public class MainActivity extends Activity {
 
     private void route(Intent intent) {
         SharedPreferences prefs = getPreferences(Context.MODE_PRIVATE);
+        // 长按图标「扫码绑定」:先把主界面加载好再拉扫码页,取消扫码回来不留白屏
+        boolean launchScan = intent != null && ACTION_SCAN_BIND.equals(intent.getAction());
 
         if (intent != null && ACTION_CHANGE_URL.equals(intent.getAction())) {
             showSetup(prefs.getString(KEY_URL, null), null);
@@ -399,11 +416,17 @@ public class MainActivity extends Activity {
                 prefs.edit().putString(KEY_URL, shared).apply();
                 recordHistory(shared);
                 showWeb(shared);
+                if (launchScan) {
+                    startScan();
+                }
                 return;
             }
         }
 
         if (switchToClipboardUrl()) {
+            if (launchScan) {
+                startScan();
+            }
             return;
         }
 
@@ -411,9 +434,16 @@ public class MainActivity extends Activity {
         if (saved != null) {
             if (!saved.equals(loadedUrl)) {
                 showWeb(saved);
+            } else if (overlayView != null) {
+                // 同一链接的 onNewIntent:回到会话层即可,不重载
+                removeOverlay();
+                onErrorPage = false;
             }
         } else {
             showSetup(null, null);
+        }
+        if (launchScan) {
+            startScan();
         }
     }
 
@@ -660,6 +690,30 @@ public class MainActivity extends Activity {
         }
         progress = null;
         fab = null;
+        sessionView = null;
+    }
+
+    /** 把设置/错误页作为覆盖层叠在会话层之上;会话层(WebView)原样保留,秒回靠它 */
+    private void showOverlay(View v) {
+        removeOverlay();
+        overlayView = v;
+        root.addView(v, contentLp());
+    }
+
+    private void removeOverlay() {
+        if (overlayView != null) {
+            root.removeView(overlayView);
+            overlayView = null;
+        }
+    }
+
+    /** 拉起扫码页(长按图标快捷方式与设置页按钮共用) */
+    private void startScan() {
+        try {
+            startActivityForResult(new Intent(this, ScanActivity.class), REQ_SCAN);
+        } catch (Exception e) {
+            Toast.makeText(this, "无法启动扫码:请确认已授予相机权限", Toast.LENGTH_LONG).show();
+        }
     }
 
     /** 打开站外链接:http(s)/mailto/tel 直接交给系统;intent:// 用 parseUri 解析(网页跳 App 的标准写法),
@@ -694,8 +748,29 @@ public class MainActivity extends Activity {
     }
 
     private void showWeb(String url) {
-        destroyWeb();
         onErrorPage = false;
+        if (sessionView == null) {
+            // 首次:构建并挂到 root(buildSessionView 内部完成 addView)
+            buildSessionView(url);
+        } else if (!url.equals(loadedUrl)) {
+            // 同一 WebView 实例直接换链接:不重建,历史/扫码/剪贴板切会话都是秒切
+            loadedUrl = url;
+            allowedHost = Uri.parse(url).getHost();
+            webLoadFailed = false;
+            if (webView != null) {
+                webView.loadUrl(url);
+            }
+        } else if (webLoadFailed && webView != null) {
+            // 同一链接但上次加载失败(错误页→设置页→返回会话):必须 reload,只掀覆盖层会露出内核错误白页
+            webLoadFailed = false;
+            webView.reload();
+        }
+        // url 相同且未失败:只是回到会话层,网页不重载、滚动位置原样(会话秒回的核心)
+        removeOverlay();
+    }
+
+    /** 构建常驻会话层(WebView+进度条+悬浮钮):整个 App 生命周期只建一次 */
+    private void buildSessionView(String url) {
         loadedUrl = url;
         allowedHost = Uri.parse(url).getHost();
         webView = new WebView(this);
@@ -868,8 +943,9 @@ public class MainActivity extends Activity {
             fab.setLayoutParams(lp);
         });
 
-        root.removeAllViews();
-        root.addView(container, new FrameLayout.LayoutParams(
+        sessionView = container;
+        // 固定在 root 最底层(index 0):设置/错误覆盖层无论何时添加都在其上
+        root.addView(sessionView, 0, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         webView.loadUrl(url);
     }
@@ -1165,8 +1241,8 @@ public class MainActivity extends Activity {
     private void showError(String message) {
         final String url = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
         onErrorPage = true;
-        loadedUrl = null;
-        destroyWeb();
+        webLoadFailed = true;
+        // 不销毁 WebView:错误页以覆盖层盖在会话层上,重试/网络恢复后 reload 即可
         LinearLayout box = darkBox();
 
         TextView icon = new TextView(this);
@@ -1187,7 +1263,13 @@ public class MainActivity extends Activity {
         stylePrimary(retry);
         box.addView(retry, buttonLp());
         retry.setOnClickListener(v -> {
-            if (url != null) {
+            if (webView != null) {
+                // 会话层还在:移除错误覆盖层后原样 reload,不重建
+                onErrorPage = false;
+                webLoadFailed = false;
+                removeOverlay();
+                webView.reload();
+            } else if (url != null) {
                 showWeb(url);
             }
         });
@@ -1198,14 +1280,12 @@ public class MainActivity extends Activity {
         box.addView(change, buttonLp());
         change.setOnClickListener(v -> showSetup(url, null));
 
-        root.removeAllViews();
-        root.addView(scrollWrap(box), contentLp());
+        showOverlay(scrollWrap(box));
     }
 
     private void showSetup(String prefill, String error) {
         onErrorPage = false;
-        loadedUrl = null;
-        destroyWeb();
+        // 不销毁 WebView:设置页以覆盖层叠在会话层上,「返回会话」秒回、网页状态保留
         LinearLayout box = darkBox();
 
         ImageView logo = new ImageView(this);
@@ -1293,13 +1373,7 @@ public class MainActivity extends Activity {
         scan.setText("扫码绑定");
         styleSecondary(scan);
         box.addView(scan, buttonLp());
-        scan.setOnClickListener(v -> {
-            try {
-                startActivityForResult(new Intent(this, ScanActivity.class), REQ_SCAN);
-            } catch (Exception e) {
-                Toast.makeText(this, "无法启动扫码:请确认已授予相机权限", Toast.LENGTH_LONG).show();
-            }
-        });
+        scan.setOnClickListener(v -> startScan());
 
         Button hist = new Button(this);
         hist.setText("历史会话");
@@ -1329,8 +1403,7 @@ public class MainActivity extends Activity {
         footer.setPadding(0, dp(28), 0, 0);
         box.addView(footer);
 
-        root.removeAllViews();
-        root.addView(scrollWrap(box), contentLp());
+        showOverlay(scrollWrap(box));
     }
 
     /** 设置页确认后的统一保存入口:存偏好、记历史、打开 */
@@ -1855,7 +1928,12 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (webView != null && webView.canGoBack()) {
+        // 设置页等覆盖层优先:返回即回到会话层(秒回),而不是退出 App;错误页覆盖层仍走退出确认
+        if (overlayView != null && !onErrorPage) {
+            removeOverlay();
+            return;
+        }
+        if (!onErrorPage && webView != null && webView.canGoBack()) {
             webView.goBack();
             return;
         }

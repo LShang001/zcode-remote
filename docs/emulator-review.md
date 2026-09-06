@@ -29,9 +29,13 @@ sleep 4
 
 1. **设置页**(无链接首启,或 `am start -n com.zcode.remote/.MainActivity -a com.zcode.remote.CHANGE_URL` 直达)——对照 `review-setup2.png`
 2. **会话页**(预置有效链接后启动)——对照 `review-session.png`
-3. **错误页**(预置 `https://nonexistent.invalid/...` 之类的死链)——对照 `review-error.png`
-4. **下拉刷新**(会话页顶部 `input swipe 540 500 540 1700 700`,立刻截图)——对照 `review-refresh.png`
+3. **错误页**——对照 `review-error.png`。**用断网法**:会话页上 `"$ADB" shell svc wifi disable; "$ADB" shell svc data disable`,SPA 自身重连请求立刻触发主框架错误 → 壳错误覆盖层;之后 `svc wifi enable; svc data enable` 顺带验证自动重连(覆盖层掀掉 + reload)。**别再用 `nonexistent.invalid` 死链**:宿主机开代理(fake-ip)时它会"解析成功"到 198.18.0.x,WebView 卡握手几十秒都不报错(2026-09-06 实测)
+4. **下拉刷新**(会话页顶部 `input swipe 630 300 630 1500 600`,起点必须在屏幕上 1/6 内,立刻截图看进度条)——对照 `review-refresh.png`
 5. **桌面图标**(`input keyevent KEYCODE_HOME` 后截图)——对照 `review-launcher.png`
+6. **会话秒回**(v2.4 加入):会话页先滑动到中部截图 → ⋮ → 更换链接 → 「返回会话」→ **0.4s 内再截图**,两图滚动位置应像素级一致、无进度条;设置页按返回键也应回会话而非退出
+7. **扫码快捷方式**(v2.4 加入):`am start -n com.zcode.remote/.MainActivity -a com.zcode.remote.SCAN_BIND` → ScanActivity 在前台 → 返回取消 → 回到会话页(不白屏)
+
+> 点菜单项/对话框按钮**用 `uiautomator dump /sdcard/ui.xml` 查 bounds 取中心**,别硬编码坐标:菜单头部"当前会话"的 URL 长短会改变菜单高度,真实 208 字符链接让菜单项整体下移约 120px,旧坐标会点错项。
 
 ## 预置链接(adb root,免手输)
 
