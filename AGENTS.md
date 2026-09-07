@@ -96,6 +96,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - 模拟器 SystemUI 对**连续两条 Toast 有竞态**:前一条未退场时后一条报 "Adding more than one toast window for UID at a time" 被静默丢弃——验证"即时反馈+结果反馈"双 Toast 链路时截图看不到第二条不代表代码没跑,以 logcat(`ToastPresenter`/`CoreBackPreview Window Toast`)为准(来源:2026-09-07 v2.6 实测)
 - 动态快捷方式(`ShortcutManager.setDynamicShortcuts`)只在 recordHistory 调用链里刷新的话,**从持久化 prefs 恢复的历史不会同步**(启动路径不经过 recordHistory)——onCreate 需补一次同步;注册情况用 `adb shell dumpsys shortcut` 查(来源:2026-09-07 v2.6 模拟器实测)
 - 模拟器默认未录指纹/人脸,`BiometricManager.canAuthenticate()` 返回 NONE_ENROLLED:应用锁在模拟器只能验"无法验证→跳过"降级分支,真认证弹窗要真机验;框架 `android.hardware.biometrics.BiometricPrompt` 为 API 28+,minSdk 26 的两档老系统直接放行不锁死(来源:2026-09-07 v2.6)
+- **Android 14+/targetSdk 34 读 `DownloadManager.COLUMN_LOCAL_FILENAME` 直接抛 SecurityException**(系统提示改用 ContentResolver.openFileDescriptor);吞掉该异常会得到 path=null,更新链路把"下载已完成"误判成"源失败"→换源重下循环→最终报下载失败,而文件其实躺在下载目录(v2.6 真机反馈的原样症状)——验签必须先经 `getUriForDownloadedFile`+`openInputStream` 拷进私有缓存再解析;**完成态(SUCCESSFUL)只允许阻断提示,绝不允许换源重下**;验签各步判定看 logcat TAG=`ZCodeUpdater`(来源:2026-09-07 v2.7 模拟器端到端实测,日志实锤 SecurityException)
 
 ## 知识沉淀协议
 
