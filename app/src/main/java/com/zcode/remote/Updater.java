@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.util.TypedValue;
 import android.view.ViewGroup;
 import android.widget.LinearLayout;
@@ -27,6 +28,9 @@ import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -41,6 +45,7 @@ import java.util.regex.Pattern;
  * 网络检查内部自起线程并 runOnUiThread 回主线程。
  */
 class Updater {
+    private static final String TAG = "ZCodeUpdater";
     static final String KEY_AUTO_UPDATE = "auto_update";
     static final String KEY_LAST_UPDATE_CHECK = "last_update_check";
     static final long UPDATE_CHECK_INTERVAL_MS = 4L * 60L * 60L * 1000L; // 自动检查节流:4 小时
@@ -78,6 +83,8 @@ class Updater {
     private int dlRound = 0;
     private long dlLastBytes = -1L;
     private long dlLastProgressAt = 0L;
+    // 已登记待验签的下载 id:-1 表示无;保证同一次下载完成只进一遍验签
+    private long verifyPendingId = -1L;
 
     private final Runnable progressPoller = new Runnable() {
         @Override
@@ -100,9 +107,9 @@ class Updater {
                 long done = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
                 long total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
                 if (status == DownloadManager.STATUS_SUCCESSFUL) {
-                    long id = pendingDownloadId;
-                    pendingDownloadId = -1L;
-                    verifyAndInstall(id);
+                    // 完成态统一交给 scheduleVerify 延迟验签:这里立即清零会让轮询停摆,
+                    // 而验签一旦走"换源"分支,新下载的进度框将永远停在"准备下载…"
+                    scheduleVerify(pendingDownloadId);
                     return;
                 }
                 if (status == DownloadManager.STATUS_FAILED) {
@@ -148,10 +155,9 @@ class Updater {
         @Override
         public void onReceive(Context context, Intent intent) {
             long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
-            // 与 progressPoller 同为主线程串行:谁先处理谁把 pendingDownloadId 置 -1,另一个自然跳过
+            // 与 progressPoller 同为主线程串行:谁先处理谁登记待验签,另一个自然跳过
             if (id == pendingDownloadId) {
-                pendingDownloadId = -1L;
-                verifyAndInstall(id);
+                scheduleVerify(id);
             }
         }
     };
@@ -380,6 +386,11 @@ class Updater {
             }
             pendingDownloadId = -1L;
         }
+        // 完成态等待验签的窗口内取消:撤掉待验签登记,避免取消后仍弹安装
+        verifyPendingId = -1L;
+        if (updateHandler != null) {
+            updateHandler.removeCallbacks(verifyRunner);
+        }
         dismissUpdateDialog();
         toast("已取消下载");
     }
@@ -423,14 +434,96 @@ class Updater {
     }
 
     /**
+     * 下载完成的统一入口:登记待验签 id 并延迟触发。
+     * 延迟两个作用:①给 DownloadManager 落盘/改名留缓冲,避免读到半成品文件;
+     * ②轮询与广播谁先看到完成都走这里,verifyPendingId 保证同一次下载只验一遍。
+     * 期间轮询继续跑:状态已是 SUCCESSFUL、字节不再增长,不会误触卡住判定。
+     */
+    private void scheduleVerify(long id) {
+        if (verifyPendingId == id) {
+            return;
+        }
+        verifyPendingId = id;
+        pendingDownloadId = -1L;
+        if (updateHandler == null) {
+            updateHandler = new Handler(Looper.getMainLooper());
+        }
+        updateHandler.removeCallbacks(verifyRunner);
+        updateHandler.postDelayed(verifyRunner, 1200);
+    }
+
+    private final Runnable verifyRunner = new Runnable() {
+        @Override
+        public void run() {
+            long id = verifyPendingId;
+            verifyPendingId = -1L;
+            if (id >= 0) {
+                verifyAndInstall(id);
+            }
+        }
+    };
+
+    /**
      * 下载完成后的安装入口:先验签再安装。第三方加速镜像是不可信通道(HTTPS 只保证到代理的链路,
      * 代理返回什么内容完全由它决定),必须确认下载的 APK 包名一致、版本更高、签名与已装本应用完全相同,
-     * 才拉起安装器;任一不符都删文件并报错,挡住镜像投毒/返回错误内容。
+     * 才拉起安装器;内容不符删文件并报错,挡住镜像投毒/返回错误内容。
+     * 注意:走到这里说明下载本身已成功,任何"读不到/解不开"都不得按"源失败"换源重下
+     * (v2.6 真机踩坑:完成态被误判失败导致整轮重复下载),只允许阻断并给出可操作的提示。
      */
     private void verifyAndInstall(long downloadId) {
         dismissUpdateDialog();
         DownloadManager dm = (DownloadManager) activity.getSystemService(Context.DOWNLOAD_SERVICE);
-        String path = null;
+        String path = queryLocalFilename(dm, downloadId);
+        Log.i(TAG, "verify start id=" + downloadId + " path=" + path);
+        // 路径列拿不到(OEM/权限差异)时,退回应由内容 URI 拷贝:验签只信自己缓存目录里的副本
+        String parsePath = path;
+        boolean copied = false;
+        if (parsePath == null || !hasZipMagic(parsePath)) {
+            parsePath = copyToCache(dm, downloadId);
+            copied = parsePath != null;
+            Log.i(TAG, "path unusable, cache copy=" + parsePath);
+        }
+        if (parsePath == null) {
+            // 连内容都读不到:下载记录在但文件不可达,不删不换源,阻断并提示
+            blockWithMessage("下载记录存在但文件读取失败(可能被系统清理或存储权限受限),请重新检查更新,或在下载完成后到文件管理里手动安装。");
+            return;
+        }
+        if (!hasZipMagic(parsePath)) {
+            // 内容根本不是 ZIP/APK(代理返回错误页/垃圾):本源不可用,换下一个源
+            Log.w(TAG, "no zip magic, source content bad");
+            deleteQuietly(path);
+            failDownload();
+            return;
+        }
+        String error = verifyApk(parsePath);
+        Log.i(TAG, "verifyApk result=" + (error == null ? "OK" : error));
+        if (error == null) {
+            if (copied) {
+                deleteQuietly(parsePath);
+            }
+            proceedToInstall(downloadId);
+            return;
+        }
+        if (error.startsWith(NOT_VALID_APK)) {
+            // 魔数是对的但系统解析器解不开:设备侧解析异常,不是源的问题——保留文件、不换源,阻断提示
+            Log.w(TAG, "parse failed on device, keep file");
+            blockWithMessage("安装包已下载完成,但本系统无法解析校验(文件已保留在下载目录)。为安全起见不自动安装,可在文件管理中手动安装,或稍后重试。");
+            return;
+        }
+        // 包名/版本/签名不符:所有镜像服务的是同一个 GitHub 文件,换源无意义,直接阻断
+        deleteQuietly(path);
+        if (copied) {
+            deleteQuietly(parsePath);
+        }
+        new AlertDialog.Builder(activity)
+                .setTitle("更新包校验失败,已阻止安装")
+                .setMessage("下载的安装包" + error + ",文件已删除。\n\n这可能是下载源内容被篡改,请不要安装;可稍后重试,或在电脑端下载后传到手机安装。")
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
+    /** 查 DownloadManager 记录的本地文件路径;列缺失/为空返回 null */
+    private String queryLocalFilename(DownloadManager dm, long downloadId) {
         try {
             Cursor c = dm.query(new DownloadManager.Query().setFilterById(downloadId));
             if (c != null) {
@@ -438,38 +531,84 @@ class Updater {
                     if (c.moveToFirst()) {
                         int idx = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_FILENAME);
                         if (idx >= 0) {
-                            path = c.getString(idx);
+                            String p = c.getString(idx);
+                            if (p != null && !p.isEmpty()) {
+                                return p;
+                            }
                         }
                     }
                 } finally {
                     c.close();
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "query path failed: " + e);
         }
-        if (path == null) {
-            // 连文件都找不到,当本源失败处理,轮换下一个下载源
-            failDownload();
-            return;
+        return null;
+    }
+
+    /** 读文件头 4 字节判 ZIP 魔数(PK\3\4);读不到返回 false */
+    private static boolean hasZipMagic(String path) {
+        try (FileInputStream in = new FileInputStream(path)) {
+            byte[] head = new byte[4];
+            int n = 0;
+            while (n < 4) {
+                int r = in.read(head, n, 4 - n);
+                if (r < 0) {
+                    break;
+                }
+                n += r;
+            }
+            return n == 4 && head[0] == 0x50 && head[1] == 0x4B && head[2] == 0x03 && head[3] == 0x04;
+        } catch (Exception e) {
+            return false;
         }
-        String error = verifyApk(path);
-        if (error == null) {
-            proceedToInstall(downloadId);
-            return;
-        }
+    }
+
+    /** 经 DownloadManager 内容 URI 把已下载文件拷进应用私有缓存:不依赖存储权限与路径列,解析必可达 */
+    private String copyToCache(DownloadManager dm, long downloadId) {
+        Uri uri = null;
         try {
-            new File(path).delete();
-        } catch (Exception ignored) {
+            uri = dm.getUriForDownloadedFile(downloadId);
+        } catch (Exception e) {
+            Log.w(TAG, "getUri failed: " + e);
         }
-        if (error.startsWith(NOT_VALID_APK)) {
-            // 文件根本不是有效 APK(代理返回错误页/垃圾内容):本源不可用,failDownload 会换下一个源
-            failDownload();
-            return;
+        if (uri == null) {
+            return null;
         }
-        // 包名/版本/签名不符:所有镜像服务的是同一个 GitHub 文件,换源无意义,直接阻断
+        File dst = new File(activity.getCacheDir(), "update-" + downloadId + ".apk");
+        try (InputStream in = activity.getContentResolver().openInputStream(uri);
+             FileOutputStream out = new FileOutputStream(dst)) {
+            if (in == null) {
+                return null;
+            }
+            byte[] buf = new byte[65536];
+            int r;
+            while ((r = in.read(buf)) > 0) {
+                out.write(buf, 0, r);
+            }
+            return dst.getAbsolutePath();
+        } catch (Exception e) {
+            Log.w(TAG, "copy to cache failed: " + e);
+            deleteQuietly(dst.getAbsolutePath());
+            return null;
+        }
+    }
+
+    private void deleteQuietly(String path) {
+        if (path != null) {
+            try {
+                new File(path).delete();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** 下载已成功但无法继续(读取/解析异常):不换源不重下,给出可操作提示 */
+    private void blockWithMessage(String message) {
         new AlertDialog.Builder(activity)
-                .setTitle("更新包校验失败,已阻止安装")
-                .setMessage("下载的安装包" + error + ",文件已删除。\n\n这可能是下载源内容被篡改,请不要安装;可稍后重试,或在电脑端下载后传到手机安装。")
+                .setTitle("下载完成,但无法自动安装")
+                .setMessage(message)
                 .setPositiveButton("知道了", null)
                 .show();
     }
@@ -597,8 +736,12 @@ class Updater {
         launchInstaller(id);
     }
 
-    /** Activity 销毁时收尾:停轮询、关进度框 */
+    /** Activity 销毁时收尾:停轮询、撤待验签、关进度框 */
     void onDestroy() {
+        verifyPendingId = -1L;
+        if (updateHandler != null) {
+            updateHandler.removeCallbacks(verifyRunner);
+        }
         dismissUpdateDialog();
         unregisterReceiver();
     }
