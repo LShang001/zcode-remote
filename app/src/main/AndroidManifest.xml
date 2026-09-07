@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 扫码识别成功时短震动反馈(普通权限,安装即授予,无需运行时申请) -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 应用锁:框架 BiometricPrompt(API 28+)要求声明,普通权限安装即授予 -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <!-- 相机非硬性要求,无摄像头设备仍可安装,只是扫码不可用 -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <!-- allowBackup=false:SharedPreferences 里的远程链接带 sid(等于控制电脑的凭证),禁止云备份/adb backup 外泄;
@@ -19,6 +21,7 @@
         android:allowBackup="false"
         android:fullBackupContent="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
+        android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:label="ZCode Remote"
         android:theme="@style/Theme.App">

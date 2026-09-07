@@ -37,7 +37,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 
 | 路径 | 为什么必须知道 |
 |------|---------------|
-| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、更新、历史会话等逻辑与 UI 都在这(约 2000 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页 |
+| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、历史会话、应用锁、会话码等逻辑与 UI 都在这(约 1700 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页 |
+| `app/src/main/java/com/zcode/remote/Updater.java` | 版本自动更新全链路(v2.6 从 MainActivity 拆出):GitHub Releases 检查、镜像轮换下载、进度轮询、APK 验签、安装引导,状态机与阈值全在此类;MainActivity 只持有 `updater` 实例做委托 |
 | `app/src/main/java/com/zcode/remote/ScanActivity.java` | 扫码绑定页:Camera1 预览 + zxing core 解码,识别远程二维码回传链接给 MainActivity |
 | `gradle.properties` | `android.overridePathCheck=true` 支撑着中文路径构建,删了构建必挂 |
 | `docs/screenshots/` | v1.1 五张视觉基准图;改 UI 后逐张对照,防回归 |
@@ -46,8 +47,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 ## 原则
 
 1. **壳的本分** — 网页内的功能与 UI 归 ZCode 官方;壳只做装载、链接管理和移动体验,增强走系统能力(下载管理、外链跳浏览器),保持不注入 CSS/JS 改网页(会随网页更新碎掉)
-2. **极简优先** — 逻辑收进 MainActivity(扫码独立成 ScanActivity),UI 用代码构建;第三方依赖目前仅 zxing:core 一个纯 Java 库;每加一个依赖先问能不能不加(扫码用 core+Camera1 而非 zxing-android-embedded 全家桶就是这个原则)
-3. **发版四同步** — `versionCode` +1、`versionName`、设置页 footer 版本(常量 `APP_VERSION`)、GitHub Release(tag `vX.Y` + 上传 APK),一次发版四处同改;漏发 Release 等于用户永远收不到更新
+2. **极简优先** — 逻辑收进 MainActivity(扫码独立成 ScanActivity,更新链路独立成 Updater),UI 用代码构建;第三方依赖目前仅 zxing:core 一个纯 Java 库(解码+编码会话码都用它);每加一个依赖先问能不能不加(扫码用 core+Camera1 而非 zxing-android-embedded 全家桶就是这个原则)
+3. **发版四同步** — `versionCode` +1、`versionName`、GitHub Release(tag `vX.Y` + 上传 APK),一次发版三处同改;界面显示的版本号运行时读 PackageInfo,无需人肉同步;漏发 Release 等于用户永远收不到更新
 4. **眼见为实** — 改 UI 后在模拟器跑起来截图,用 Read 亲眼看图确认才算完成
 
 ## 边界
@@ -90,6 +91,11 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - 模拟器自动化点菜单/对话框**一律 `uiautomator dump` 查 bounds 取中心,不要硬编码坐标**:菜单头部"当前会话"显示的 URL 长度会改变菜单高度(真实链接 208 字符让菜单项整体下移约 120px,旧坐标会点错项);另外 uiautomator dump 抓不到 Toast(独立窗口不在 view 树),验证这类提示要看副作用而非找文字(来源:2026-09-06 v2.4)
 - 更新下载的 stall(卡住)判定:**DownloadManager 的 PENDING/PAUSED 都是"字节必然不动的调度态",必须持续刷新计时戳**,否则等待时长被累进 RUNNING 的卡住判定,刚恢复传输就被误杀换源(v2.4"每个源下载一半即失败"就是这个+20s 阈值太激进,匀速下载 20s≈一半进度;现 60s,来源:2026-09-06 v2.5)
 - 判定下载"误杀 vs 真断流"看失败耗时:远小于 stall 阈值就失败 = `STATUS_FAILED` 真断流(换源是正确行为);固定进度点失败且该点≈代理缓冲区大小(如 67KB/20%) = 代理流断。**模拟器(宿主代理 fake-ip)下镜像必真断流,端到端下载验证只能真机做**,模拟器只验证"检查更新→弹窗→发起下载→状态机轮换";验证新下载逻辑可用"伪装版本号"法:sed 临时调低 versionName 构建含修复的包装模拟器,让真 latest 触发更新(测完立即恢复版本号重建)(来源:2026-09-06 v2.5)
+- Manifest 声明 `enableOnBackInvokedCallback="true"` 后,Android 13+ **不再回调 `onBackPressed`**,返回手势直接 finish——必须 `getOnBackInvokedDispatcher().registerOnBackInvokedCallback` 接管,且回调里"未消费"分支要自己 `finish()`(覆盖层"返回=回会话"语义否则全丢);12 及以下仍走 onBackPressed,两条路共用一个 handleBack(来源:2026-09-07 v2.6)
+- 渲染崩溃自愈的模拟器验证法:`adb shell ps -A | grep sandboxed` 找 `com.google.android.webview:sandboxed_process0` 的 pid,`kill -9` 即触发 `onRenderProcessGone`;自愈成功=App 主进程存活且会话层重建重载(来源:2026-09-07 v2.6 模拟器实测)
+- 模拟器 SystemUI 对**连续两条 Toast 有竞态**:前一条未退场时后一条报 "Adding more than one toast window for UID at a time" 被静默丢弃——验证"即时反馈+结果反馈"双 Toast 链路时截图看不到第二条不代表代码没跑,以 logcat(`ToastPresenter`/`CoreBackPreview Window Toast`)为准(来源:2026-09-07 v2.6 实测)
+- 动态快捷方式(`ShortcutManager.setDynamicShortcuts`)只在 recordHistory 调用链里刷新的话,**从持久化 prefs 恢复的历史不会同步**(启动路径不经过 recordHistory)——onCreate 需补一次同步;注册情况用 `adb shell dumpsys shortcut` 查(来源:2026-09-07 v2.6 模拟器实测)
+- 模拟器默认未录指纹/人脸,`BiometricManager.canAuthenticate()` 返回 NONE_ENROLLED:应用锁在模拟器只能验"无法验证→跳过"降级分支,真认证弹窗要真机验;框架 `android.hardware.biometrics.BiometricPrompt` 为 API 28+,minSdk 26 的两档老系统直接放行不锁死(来源:2026-09-07 v2.6)
 
 ## 知识沉淀协议
 

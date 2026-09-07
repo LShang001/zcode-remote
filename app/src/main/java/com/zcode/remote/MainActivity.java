@@ -3,22 +3,22 @@ package com.zcode.remote;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
-import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
-import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
-import android.content.pm.Signature;
+import android.content.pm.ShortcutInfo;
+import android.content.pm.ShortcutManager;
 import android.content.res.ColorStateList;
-import android.database.Cursor;
+import android.graphics.Bitmap;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.Icon;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.CancellationSignal;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
@@ -50,23 +50,17 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import android.Manifest;
 import android.content.pm.ApplicationInfo;
-import android.content.pm.PackageManager;
+import android.hardware.biometrics.BiometricManager;
+import android.hardware.biometrics.BiometricPrompt;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -74,41 +68,30 @@ import android.net.NetworkRequest;
 import android.webkit.WebStorage;
 import android.webkit.WebViewDatabase;
 
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.common.BitMatrix;
+import com.google.zxing.qrcode.QRCodeWriter;
+
 
 public class MainActivity extends Activity {
     private static final String KEY_URL = "url";
     private static final String KEY_FAB_X = "fab_x";
     private static final String KEY_FAB_Y = "fab_y";
     private static final String KEY_SHOW_FAB = "show_fab";
-    private static final String KEY_AUTO_UPDATE = "auto_update";
+    private static final String KEY_APP_LOCK = "app_lock";
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final String ACTION_SCAN_BIND = "com.zcode.remote.SCAN_BIND";
+    private static final String ACTION_OPEN_SESSION = "com.zcode.remote.OPEN_SESSION";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
-    // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk
+    // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk(逻辑在 Updater)
     static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
     private static final String KEY_HISTORY = "history_urls";
     private static final int MAX_HISTORY = 8;
-    private static final String KEY_LAST_UPDATE_CHECK = "last_update_check";
-    private static final long UPDATE_CHECK_INTERVAL_MS = 4L * 60L * 60L * 1000L; // 自动检查节流:4 小时
-    private static final String RELEASE_API = "https://api.github.com/repos/LShang001/zcode-remote/releases/latest";
-    private static final Pattern TAG_JSON = Pattern.compile("\"tag_name\"\\s*:\\s*\"v?([0-9][0-9.]*)\"");
-    private static final Pattern APK_URL_JSON = Pattern.compile("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.apk)\"");
-    // 更新安装包下载源:国内 GitHub 加速前缀优先(把完整 github.com 下载 URL 拼在后面),
-    // 失败或卡住自动切下一个,全部不可用再回退 GitHub 官方源。免费公共代理可用性会变,多放几个兜底。
-    private static final String[] DL_MIRRORS = {
-            // gh-proxy.com 用户真机实测可用(2026-09-04),排第一优先命中
-            "https://gh-proxy.com/",
-            "https://ghfast.top/",
-            "https://gh.llkk.cc/",
-            "https://ghproxy.net/"
-    };
-    // 下载卡住(无字节增长)判定阈值:代理回源慢/弱网抖动 20s+ 很常见,误杀会整轮换源重下,代价远大于多等
-    private static final long DL_STALL_TIMEOUT_MS = 60_000L;
-    private static final int BG = 0xFF0F1014;
-    private static final int FG = 0xFFEDEEF0;
-    private static final int FG_DIM = 0xFF9AA0A6;
+    static final int BG = 0xFF0F1014;
+    static final int FG = 0xFFEDEEF0;
+    static final int FG_DIM = 0xFF9AA0A6;
     private static final int RED = 0xFFFF6E6E;
-    private static final int ACCENT = 0xFF4C8DFF;
+    static final int ACCENT = 0xFF4C8DFF;
     private static final int BTN_PRIMARY = 0xFF1B5BD7;
     private static final int BTN_SECONDARY = 0xFF2A2D36;
     private static final int REQ_FILE = 1;
@@ -128,108 +111,21 @@ public class MainActivity extends Activity {
     private String allowedHost;
     private String loadedUrl;
     private String lastAdoptedClip;
-    private long pendingDownloadId = -1L;
-    private String pendingVersion;
-    private String pendingUrl;
-    private AlertDialog updateDialog;
-    private ProgressBar updateBar;
-    private TextView updateText;
-    private Handler updateHandler;
     private TextView fab;
     private AlertDialog menuDialog;
     private long lastBackTime = 0L;
     private ConnectivityManager.NetworkCallback networkCallback;
     private boolean onErrorPage = false;
-    // 是否在前台:剪贴板监听只在前台响应;版本/签名缓存
+    // 是否在前台:剪贴板监听只在前台响应
     private boolean inForeground = false;
     private ClipboardManager.OnPrimaryClipChangedListener clipListener;
     // 上次已处理过的剪贴板时间戳:内容没变就不重复读取(Android 12+ 读取他应用剪贴板会弹系统提示)
     private long lastClipTimestamp = -1L;
-    private String appVersionCache;
-    private Signature[] ownSignatures;
-    // 下载完成但缺"安装未知应用"权限时,暂存下载 id;授权回前台后续装(文件还在,不用重新下载)
-    private long pendingInstallDownloadId = -1L;
-    // 更新下载源切换状态:-1..N-2 为 DL_MIRRORS 下标,N-1 表示官方源;-1 表示尚未开始
-    private int dlSourceIndex = -1;
-    private int dlRound = 0;
-    private long dlLastBytes = -1L;
-    private long dlLastProgressAt = 0L;
-    private final Runnable progressPoller = new Runnable() {
-        @Override
-        public void run() {
-            if (updateDialog == null || pendingDownloadId < 0) {
-                return;
-            }
-            DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-            Cursor c = dm.query(new DownloadManager.Query().setFilterById(pendingDownloadId));
-            if (c == null) {
-                repost();
-                return;
-            }
-            try {
-                if (!c.moveToFirst()) {
-                    failDownload();
-                    return;
-                }
-                int status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
-                long done = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
-                long total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
-                if (status == DownloadManager.STATUS_SUCCESSFUL) {
-                    long id = pendingDownloadId;
-                    pendingDownloadId = -1L;
-                    verifyAndInstall(id);
-                    return;
-                }
-                if (status == DownloadManager.STATUS_FAILED) {
-                    failDownload();
-                    return;
-                }
-                if (updateText != null && updateBar != null) {
-                    int pct = total > 0 ? (int) (done * 100 / total) : 0;
-                    updateBar.setProgress(pct);
-                    String extra = status == DownloadManager.STATUS_PAUSED ? " · 等待网络…" : "";
-                    updateText.setText(pct + "% · " + formatSize(done) + " / "
-                            + (total > 0 ? formatSize(total) : "?") + extra + " · " + dlSourceLabel());
-                }
-                // 卡住检测:仅 RUNNING 状态下字节长时间不增长才算(代理挂起/0 字节)。
-                // PENDING(排队)/PAUSED(等网络/切 Wi-Fi/代理解析)是系统调度,字节必然不动,
-                // 必须持续刷新计时戳:否则"等待时长"会累进 RUNNING 的卡住判定,刚恢复就被误杀
-                long now = System.currentTimeMillis();
-                if (done > dlLastBytes) {
-                    dlLastBytes = done;
-                    dlLastProgressAt = now;
-                } else if (status == DownloadManager.STATUS_PENDING
-                        || status == DownloadManager.STATUS_PAUSED) {
-                    dlLastProgressAt = now;
-                } else if (status == DownloadManager.STATUS_RUNNING
-                        && now - dlLastProgressAt > DL_STALL_TIMEOUT_MS) {
-                    failDownload();
-                    return;
-                }
-            } finally {
-                c.close();
-            }
-            repost();
-        }
-
-        private void repost() {
-            if (updateHandler != null) {
-                updateHandler.postDelayed(this, 400);
-            }
-        }
-    };
-
-    private final BroadcastReceiver downloadDone = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
-            // 与 progressPoller 同为主线程串行:谁先处理谁把 pendingDownloadId 置 -1,另一个自然跳过
-            if (id == pendingDownloadId) {
-                pendingDownloadId = -1L;
-                verifyAndInstall(id);
-            }
-        }
-    };
+    // 更新链路(v2.6 拆分为独立类):检查/下载/验签/安装
+    private final Updater updater = new Updater(this);
+    // 应用锁:进程存活期间验过一次即可(unlockedThisSession),lockArmed 防 onResume 重入重复弹验证
+    private boolean unlockedThisSession = false;
+    private boolean lockArmed = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -239,46 +135,46 @@ public class MainActivity extends Activity {
         boolean debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
         WebView.setWebContentsDebuggingEnabled(debuggable);
         // targetSdk 34 要求动态注册非豁免系统广播时显式声明导出标志;系统服务(DownloadManager)不受 NOT_EXPORTED 影响
-        IntentFilter doneFilter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(downloadDone, doneFilter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(downloadDone, doneFilter);
-        }
+        updater.registerReceiver();
+        registerBackCallback();
         registerNetworkCallback();
         registerClipboardListener();
         maybeRequestNotificationPermission();
         root = new FrameLayout(this);
         root.setBackgroundColor(BG);
         setContentView(root);
+        // 历史可能来自上次会话的持久化(本次启动不一定会走 recordHistory),启动即同步一次快捷方式
+        updateDynamicShortcuts();
         route(getIntent());
         SharedPreferences sp = getPreferences(Context.MODE_PRIVATE);
         // 自动检查节流:距上次检查不足 4 小时则跳过,避免每次冷启动都打 GitHub API
-        if (sp.getBoolean(KEY_AUTO_UPDATE, true)
-                && System.currentTimeMillis() - sp.getLong(KEY_LAST_UPDATE_CHECK, 0L) >= UPDATE_CHECK_INTERVAL_MS) {
-            checkUpdate(false);
+        if (sp.getBoolean(Updater.KEY_AUTO_UPDATE, true)
+                && System.currentTimeMillis() - sp.getLong(Updater.KEY_LAST_UPDATE_CHECK, 0L)
+                >= Updater.UPDATE_CHECK_INTERVAL_MS) {
+            updater.checkUpdate(false);
         }
     }
 
-    /** 版本号单一来源:运行时读 PackageInfo,菜单/关于/更新比较都用它,避免与 build.gradle 双写漏改 */
+    /**
+     * 预测性返回(Android 13+):Manifest 声明 enableOnBackInvokedCallback 后系统不再回调
+     * onBackPressed,必须显式注册 OnBackInvokedCallback 接管,否则返回手势直接退出 App、
+     * 覆盖层"返回=回会话"的语义失效。低版本仍走 onBackPressed,两条路共用 handleBack。
+     */
+    private void registerBackCallback() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                    () -> {
+                        if (!handleBack()) {
+                            finish();
+                        }
+                    });
+        }
+    }
+
+    /** 版本号单一来源在 Updater(运行时读 PackageInfo),避免与 build.gradle 双写漏改 */
     private String appVersion() {
-        if (appVersionCache == null) {
-            try {
-                appVersionCache = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
-            } catch (Exception e) {
-                appVersionCache = "0";
-            }
-        }
-        return appVersionCache;
-    }
-
-    private long appVersionCode() {
-        try {
-            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
-            return Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : (long) info.versionCode;
-        } catch (Exception e) {
-            return 0L;
-        }
+        return updater.appVersion();
     }
 
     /**
@@ -367,7 +263,8 @@ public class MainActivity extends Activity {
             switchToClipboardUrl();
         }
         // 从"安装未知应用"授权设置回来:已有验签通过的包就直接续装
-        maybeResumeInstallAfterPermission();
+        updater.maybeResumeInstallAfterPermission();
+        maybeArmAppLock();
     }
 
     @Override
@@ -398,6 +295,17 @@ public class MainActivity extends Activity {
         if (intent != null && ACTION_CHANGE_URL.equals(intent.getAction())) {
             showSetup(prefs.getString(KEY_URL, null), null);
             return;
+        }
+
+        // 长按图标的动态快捷方式:直达指定历史会话
+        if (intent != null && ACTION_OPEN_SESSION.equals(intent.getAction())) {
+            String target = intent.getStringExtra(KEY_URL);
+            if (target != null && REMOTE_URL.matcher(target).find()) {
+                prefs.edit().putString(KEY_URL, target).apply();
+                recordHistory(target);
+                showWeb(target);
+                return;
+            }
         }
 
         // 在其他 App(微信/QQ/短信)里点击或分享远程链接,直接用本 App 打开
@@ -507,10 +415,12 @@ public class MainActivity extends Activity {
             }
         }
         getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_HISTORY, arr.toString()).apply();
+        updateDynamicShortcuts();
     }
 
     private void clearHistory() {
         getPreferences(Context.MODE_PRIVATE).edit().remove(KEY_HISTORY).apply();
+        updateDynamicShortcuts();
     }
 
     /** 删除单条历史;若删的是当前会话,不改变当前加载,仅从列表移除 */
@@ -530,6 +440,7 @@ public class MainActivity extends Activity {
             }
         }
         getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_HISTORY, arr.toString()).apply();
+        updateDynamicShortcuts();
     }
 
     private String formatRelativeTime(long time) {
@@ -828,6 +739,26 @@ public class MainActivity extends Activity {
                     showError(msg);
                 }
             }
+
+            /**
+             * 渲染进程被系统杀掉(内存紧张常见):不处理会白屏卡死甚至连带杀 App。
+             * 自愈流程:摘除并销毁死掉的 WebView,按当前链接重建会话层。返回 true 表示已接管。
+             */
+            @Override
+            public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
+                String url = loadedUrl;
+                destroyWeb();
+                webLoadFailed = false;
+                onErrorPage = false;
+                removeOverlay();
+                toast("页面进程意外终止,正在自动恢复…");
+                if (url != null) {
+                    showWeb(url);
+                } else {
+                    showSetup(null, null);
+                }
+                return true;
+            }
         });
 
         webView.setWebChromeClient(new WebChromeClient() {
@@ -1070,7 +1001,8 @@ public class MainActivity extends Activity {
             }
         }));
         box.addView(panelRow("🕒", "历史会话", "查看或切换最近使用过的会话", v -> showHistoryDialog()));
-        box.addView(panelRow("⬇", "检查更新", "查看 GitHub 上是否有新版本", v -> checkUpdate(true)));
+        box.addView(panelRow("▣", "出示会话码", "把当前链接生成二维码,供其他设备扫码接管", v -> showSessionQr(url)));
+        box.addView(panelRow("⬇", "检查更新", "查看 GitHub 上是否有新版本", v -> updater.checkUpdate(true)));
 
         box.addView(panelHeader("设置"));
         box.addView(panelSwitch("保持屏幕常亮", "监视任务时防止手机自动休眠", KEY_KEEP_SCREEN_ON, (c) -> {
@@ -1084,7 +1016,16 @@ public class MainActivity extends Activity {
             Toast.makeText(this, c ? "悬浮按钮已开启"
                     : "已隐藏,从设置页可再开启", Toast.LENGTH_SHORT).show();
         }));
-        box.addView(panelSwitch("启动时自动检查更新", "打开 App 时在后台静默检查", KEY_AUTO_UPDATE, (c) -> {
+        box.addView(panelSwitch("启动时自动检查更新", "打开 App 时在后台静默检查", Updater.KEY_AUTO_UPDATE, (c) -> {
+        }));
+        // 应用锁默认关;开启即视为本次进程已验证,不立刻弹验证框
+        box.addView(panelSwitch("应用锁(指纹/人脸)", "打开 App 时需生物识别验证,防止他人借用会话", KEY_APP_LOCK, false, (c) -> {
+            if (c) {
+                unlockedThisSession = true;
+                Toast.makeText(this, "已开启:下次冷启动 App 时需要验证", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "已关闭应用锁", Toast.LENGTH_SHORT).show();
+            }
         }));
 
         box.addView(panelHeader("工具"));
@@ -1169,6 +1110,10 @@ public class MainActivity extends Activity {
     }
 
     private View panelSwitch(String title, String sub, String prefKey, SwitchChanged onChanged) {
+        return panelSwitch(title, sub, prefKey, true, onChanged);
+    }
+
+    private View panelSwitch(String title, String sub, String prefKey, boolean def, SwitchChanged onChanged) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -1192,7 +1137,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
         Switch sw = new Switch(this);
-        sw.setChecked(getPreferences(Context.MODE_PRIVATE).getBoolean(prefKey, true));
+        sw.setChecked(getPreferences(Context.MODE_PRIVATE).getBoolean(prefKey, def));
         sw.setOnCheckedChangeListener((v, c) -> {
             getPreferences(Context.MODE_PRIVATE).edit().putBoolean(prefKey, c).apply();
             onChanged.onChanged(c);
@@ -1387,7 +1332,7 @@ public class MainActivity extends Activity {
         check.setText("检查更新");
         styleSecondary(check);
         box.addView(check, buttonLp());
-        check.setOnClickListener(v -> checkUpdate(true));
+        check.setOnClickListener(v -> updater.checkUpdate(true));
 
         final String savedUrl = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
         if (savedUrl != null) {
@@ -1486,407 +1431,171 @@ public class MainActivity extends Activity {
         return m.find() ? m.group() : null;
     }
 
-    private void checkUpdate(final boolean manual) {
-        if (manual) {
-            toast("正在检查更新…");
-        } else {
-            getPreferences(Context.MODE_PRIVATE).edit()
-                    .putLong(KEY_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply();
+    /** 应用锁:开启后每次冷启动(进程新建)首次回前台要求生物识别验证,进程存活期间不重复验 */
+    private void maybeArmAppLock() {
+        if (unlockedThisSession || lockArmed
+                || !getPreferences(Context.MODE_PRIVATE).getBoolean(KEY_APP_LOCK, false)) {
+            return;
         }
-        new Thread(() -> {
-            String version = null;
-            String apkUrl = null;
-            try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(RELEASE_API).openConnection();
-                conn.setRequestProperty("Accept", "application/vnd.github+json");
-                conn.setConnectTimeout(10000);
-                conn.setReadTimeout(10000);
-                if (conn.getResponseCode() == 200) {
-                    String body = readAll(conn.getInputStream());
-                    conn.disconnect();
-                    Matcher tag = TAG_JSON.matcher(body);
-                    Matcher apk = APK_URL_JSON.matcher(body);
-                    if (tag.find() && apk.find()) {
-                        version = tag.group(1);
-                        apkUrl = apk.group(1);
-                    }
-                }
-            } catch (Exception ignored) {
-            }
-            final String v = version;
-            final String url = apkUrl;
-            runOnUiThread(() -> {
-                if (v != null && url != null && versionNewer(v, appVersion())) {
-                    offerUpdate(v, url);
-                } else if (manual) {
-                    toast(v == null ? "检查更新失败,请稍后再试" : "已是最新版本 v" + appVersion());
-                }
-            });
-        }).start();
+        lockArmed = true;
+        // 稍作延迟等窗口 focus 就绪,BiometricPrompt 在 resume 瞬间弹出更稳
+        root.postDelayed(this::showLock, 300);
     }
 
-    private boolean versionNewer(String remote, String local) {
-        try {
-            String[] a = remote.split("\\.");
-            String[] b = local.split("\\.");
-            for (int i = 0; i < Math.max(a.length, b.length); i++) {
-                int x = i < a.length ? Integer.parseInt(a[i]) : 0;
-                int y = i < b.length ? Integer.parseInt(b[i]) : 0;
-                if (x != y) {
-                    return x > y;
-                }
-            }
-        } catch (Exception ignored) {
+    private void showLock() {
+        if (Build.VERSION.SDK_INT < 28) {
+            // 框架版 BiometricPrompt API 28+;minSdk 26 的两档老系统直接放行(功能降级,不锁死用户)
+            lockArmed = false;
+            return;
         }
-        return false;
-    }
-
-    private String readAll(java.io.InputStream in) throws Exception {
-        BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
-        StringBuilder sb = new StringBuilder();
-        String line;
-        while ((line = r.readLine()) != null) {
-            sb.append(line);
-        }
-        r.close();
-        return sb.toString();
-    }
-
-    private void offerUpdate(final String version, final String url) {
-        new AlertDialog.Builder(this)
-                .setTitle("发现新版本 v" + version)
-                .setMessage("建议更新以获得最新修复。\n\n国内网络将自动优先走加速源下载,失败会自动切换;下载完成后会自动弹出安装界面,首次安装需允许本应用\"安装未知应用\"。")
-                .setPositiveButton("立即更新", (d, w) -> downloadUpdate(version, url))
-                .setNegativeButton("暂不", null)
-                .show();
-    }
-
-    private void downloadUpdate(String version, String url) {
-        pendingVersion = version;
-        pendingUrl = url;
-        dlSourceIndex = -1;
-        dlRound = 0;
-        startDownloadFromNextSource();
-    }
-
-    /** 依次尝试:国内加速镜像 → GitHub 官方源;失败/卡住自动换下一个,两轮用尽才报最终失败 */
-    private void startDownloadFromNextSource() {
-        dlSourceIndex++;
-        if (dlSourceIndex > DL_MIRRORS.length) {
-            if (dlRound < 1) {
-                // 一轮走完全部源都失败:再从头来一轮(代理可能刚恢复),第二轮结束仍失败则放弃
-                dlRound++;
-                dlSourceIndex = -1;
-                toast("所有下载源均失败,重新尝试…");
-                startDownloadFromNextSource();
-                return;
-            }
-            dismissUpdateDialog();
+        BiometricManager bm = getSystemService(BiometricManager.class);
+        int can = bm == null ? BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED : bm.canAuthenticate();
+        if (can != BiometricManager.BIOMETRIC_SUCCESS) {
+            // 没录指纹/人脸或硬件不可用:弹窗说明并给"跳过",避免把自己锁在门外
+            lockArmed = false;
             new AlertDialog.Builder(this)
-                    .setTitle("下载失败")
-                    .setMessage("已尝试全部国内加速镜像与 GitHub 官方源,均未成功。\n\n可能是当前网络无法访问这些站点,建议稍后重试,或在电脑端下载后传到手机安装。")
+                    .setTitle("应用锁无法验证")
+                    .setMessage("设备未录入可用的指纹/人脸,本次跳过验证。\n\n请在系统设置中录入生物识别,或在菜单里关闭应用锁。")
                     .setPositiveButton("知道了", null)
                     .show();
             return;
         }
-        String target = (dlSourceIndex < DL_MIRRORS.length)
-                ? DL_MIRRORS[dlSourceIndex] + pendingUrl
-                : pendingUrl;
-        dlLastBytes = -1L;
-        dlLastProgressAt = System.currentTimeMillis();
+        BiometricPrompt prompt = new BiometricPrompt.Builder(this)
+                .setTitle("验证以打开 ZCode Remote")
+                .setSubtitle("会话链接可控制你的电脑,请本人验证")
+                .setNegativeButton("跳过", getMainExecutor(), (d, w) -> {
+                    lockArmed = false;
+                    toast("已跳过本次验证");
+                })
+                .build();
+        prompt.authenticate(new CancellationSignal(), getMainExecutor(),
+                new BiometricPrompt.AuthenticationCallback() {
+                    @Override
+                    public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                        unlockedThisSession = true;
+                        lockArmed = false;
+                    }
+
+                    @Override
+                    public void onAuthenticationError(int errorCode, CharSequence errString) {
+                        // 用户取消/锁屏等:保持 armed,下次回前台再验
+                        lockArmed = false;
+                    }
+
+                    @Override
+                    public void onAuthenticationFailed() {
+                        // 单次比对失败,系统弹窗还在,允许继续尝试
+                    }
+                });
+    }
+
+    /** 出示会话码:当前链接生成 QR,供其他设备扫码接管;sid 是凭证,60 秒后自动遮蔽 */
+    private void showSessionQr(String url) {
+        if (url == null || url.isEmpty()) {
+            toast("当前无有效会话链接");
+            return;
+        }
+        Bitmap qr;
         try {
-            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(target));
-            req.setMimeType("application/vnd.android.package-archive");
-            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,
-                    "ZCodeRemote-v" + pendingVersion + ".apk");
-            pendingDownloadId = ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(req);
-            if (updateDialog == null || !updateDialog.isShowing()) {
-                showDownloadProgress(pendingVersion);
-            } else {
-                toast("正在切换下载源:" + dlSourceLabel());
-                // 对话框已存在时不会重建,轮询也不会自动续上,这里显式重启
-                if (updateHandler == null) {
-                    updateHandler = new Handler(Looper.getMainLooper());
+            // 高纠错等级:容忍扫码端反光/折叠;520 上限覆盖 200+ 字符链接的模块密度
+            BitMatrix matrix = new QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, 520, 520);
+            int w = matrix.getWidth();
+            int h = matrix.getHeight();
+            int[] pixels = new int[w * h];
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    pixels[y * w + x] = matrix.get(x, y) ? 0xFF000000 : 0xFFFFFFFF;
                 }
-                updateHandler.removeCallbacks(progressPoller);
-                updateHandler.postDelayed(progressPoller, 400);
             }
+            qr = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888);
         } catch (Exception e) {
-            failDownload();
+            toast("二维码生成失败");
+            return;
         }
-    }
 
-    private String dlSourceLabel() {
-        if (dlSourceIndex < 0) {
-            return "";
-        }
-        if (dlSourceIndex < DL_MIRRORS.length) {
-            try {
-                return "加速源 " + (dlSourceIndex + 1);
-            } catch (Exception ignored) {
-                return "加速源";
-            }
-        }
-        return "GitHub 官方";
-    }
-
-    private void showDownloadProgress(String version) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(24), dp(4), dp(24), 0);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.setPadding(dp(24), dp(8), dp(24), 0);
 
-        updateText = new TextView(this);
-        updateText.setTextColor(FG_DIM);
-        updateText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        updateText.setText("准备下载…");
-        box.addView(updateText);
+        // 白底衬垫:深色主题下 QR 直接黑底白块对比度反了,扫码端二值化易失败
+        FrameLayout pad = new FrameLayout(this);
+        pad.setBackgroundColor(0xFFFFFFFF);
+        pad.setPadding(dp(12), dp(12), dp(12), dp(12));
+        ImageView iv = new ImageView(this);
+        iv.setImageBitmap(qr);
+        pad.addView(iv, new FrameLayout.LayoutParams(dp(240), dp(240)));
+        box.addView(pad);
 
-        updateBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        updateBar.setMax(100);
-        updateBar.setProgressTintList(ColorStateList.valueOf(ACCENT));
-        LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        barLp.topMargin = dp(12);
-        box.addView(updateBar, barLp);
+        TextView hint = new TextView(this);
+        hint.setTextColor(FG_DIM);
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        hint.setGravity(Gravity.CENTER_HORIZONTAL);
+        hint.setPadding(0, dp(12), 0, 0);
+        box.addView(hint);
 
-        updateDialog = new AlertDialog.Builder(this)
-                .setTitle("正在下载 v" + version)
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("会话二维码")
                 .setView(box)
-                .setCancelable(false)
-                .setPositiveButton("取消下载", (d, w) -> cancelDownload())
+                .setPositiveButton("关闭", null)
                 .show();
-        if (updateHandler == null) {
-            updateHandler = new Handler(Looper.getMainLooper());
-        }
-        updateHandler.removeCallbacks(progressPoller);
-        updateHandler.postDelayed(progressPoller, 400);
-    }
 
-    private void cancelDownload() {
-        if (pendingDownloadId >= 0) {
-            try {
-                ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).remove(pendingDownloadId);
-            } catch (Exception ignored) {
+        // 60 秒倒计时后遮蔽(sid=控制电脑的凭证,防止亮屏久置被旁人扫走)
+        Handler countdown = new Handler(Looper.getMainLooper());
+        final int[] left = {60};
+        Runnable tick = new Runnable() {
+            @Override
+            public void run() {
+                if (!dialog.isShowing()) {
+                    return;
+                }
+                left[0]--;
+                if (left[0] > 0) {
+                    hint.setText("链接含会话凭证,请勿外传 · " + left[0] + " 秒后自动遮蔽");
+                    countdown.postDelayed(this, 1000);
+                } else {
+                    // 连白底衬垫一起隐藏:只藏 ImageView 会留下一块空白白条
+                    pad.setVisibility(View.GONE);
+                    hint.setText("已遮蔽:链接含会话凭证,久置可能被旁人扫走。\n如需继续出示,请重新打开本页。");
+                }
             }
-            pendingDownloadId = -1L;
-        }
-        dismissUpdateDialog();
-        toast("已取消下载");
-    }
-
-    private void failDownload() {
-        if (pendingDownloadId >= 0) {
-            try {
-                ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).remove(pendingDownloadId);
-            } catch (Exception ignored) {
-            }
-            pendingDownloadId = -1L;
-        }
-        // 当前源失败:换下一个下载源(镜像 → 官方 → 再来一轮),轮次用尽由 startDownloadFromNextSource 报最终失败
-        if (pendingUrl != null) {
-            toast(dlSourceLabel() + " 不可用,切换下载源…");
-            startDownloadFromNextSource();
-        }
-    }
-
-    private void dismissUpdateDialog() {
-        if (updateHandler != null) {
-            updateHandler.removeCallbacks(progressPoller);
-        }
-        if (updateDialog != null && updateDialog.isShowing()) {
-            try {
-                updateDialog.dismiss();
-            } catch (Exception ignored) {
-            }
-        }
-        updateDialog = null;
-    }
-
-    private String formatSize(long b) {
-        if (b >= 1024 * 1024) {
-            return String.format("%.1f MB", b / 1048576.0);
-        }
-        if (b >= 1024) {
-            return (b / 1024) + " KB";
-        }
-        return b + " B";
+        };
+        hint.setText("链接含会话凭证,请勿外传 · 60 秒后自动遮蔽");
+        countdown.postDelayed(tick, 1000);
+        dialog.setOnDismissListener(d -> countdown.removeCallbacks(tick));
     }
 
     /**
-     * 下载完成后的安装入口:先验签再安装。第三方加速镜像是不可信通道(HTTPS 只保证到代理的链路,
-     * 代理返回什么内容完全由它决定),必须确认下载的 APK 包名一致、版本更高、签名与已装本应用完全相同,
-     * 才拉起安装器;任一不符都删文件并报错,挡住镜像投毒/返回错误内容。
+     * 动态快捷方式:长按图标直达最近两个会话(排在静态"更换链接/扫码绑定"之前)。
+     * sid 会随会话轮换,快捷方式跟历史列表同步刷新;API 26+ 才支持 pinned/dynamic shortcuts。
      */
-    private void verifyAndInstall(long downloadId) {
-        dismissUpdateDialog();
-        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-        String path = null;
+    private void updateDynamicShortcuts() {
+        if (Build.VERSION.SDK_INT < 26) {
+            return;
+        }
         try {
-            Cursor c = dm.query(new DownloadManager.Query().setFilterById(downloadId));
-            if (c != null) {
-                try {
-                    if (c.moveToFirst()) {
-                        int idx = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_FILENAME);
-                        if (idx >= 0) {
-                            path = c.getString(idx);
-                        }
-                    }
-                } finally {
-                    c.close();
-                }
+            ShortcutManager sm = getSystemService(ShortcutManager.class);
+            if (sm == null) {
+                return;
             }
+            List<ShortcutInfo> list = new ArrayList<>();
+            List<HistoryItem> history = getHistoryList();
+            for (int i = 0; i < history.size() && i < 2; i++) {
+                HistoryItem item = history.get(i);
+                list.add(new ShortcutInfo.Builder(this, "session_" + i)
+                        .setShortLabel(summarizeUrl(item.url))
+                        .setLongLabel("打开会话 " + summarizeUrl(item.url))
+                        .setIcon(Icon.createWithResource(this, R.drawable.ic_launcher_foreground))
+                        .setIntent(new Intent(this, MainActivity.class)
+                                .setAction(ACTION_OPEN_SESSION)
+                                .putExtra(KEY_URL, item.url)
+                                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP))
+                        .build());
+            }
+            sm.setDynamicShortcuts(list);
         } catch (Exception ignored) {
+            // 桌面启动器限流等场景会抛异常,快捷方式是锦上添花,失败不影响主流程
         }
-        if (path == null) {
-            // 连文件都找不到,当本源失败处理,轮换下一个下载源
-            failDownload();
-            return;
-        }
-        String error = verifyApk(path);
-        if (error == null) {
-            proceedToInstall(downloadId);
-            return;
-        }
-        try {
-            new File(path).delete();
-        } catch (Exception ignored) {
-        }
-        if (error.startsWith(NOT_VALID_APK)) {
-            // 文件根本不是有效 APK(代理返回错误页/垃圾内容):本源不可用,failDownload 会换下一个源
-            failDownload();
-            return;
-        }
-        // 包名/版本/签名不符:所有镜像服务的是同一个 GitHub 文件,换源无意义,直接阻断
-        new AlertDialog.Builder(this)
-                .setTitle("更新包校验失败,已阻止安装")
-                .setMessage("下载的安装包" + error + ",文件已删除。\n\n这可能是下载源内容被篡改,请不要安装;可稍后重试,或在电脑端下载后传到手机安装。")
-                .setPositiveButton("知道了", null)
-                .show();
-    }
-
-    private static final String NOT_VALID_APK = "NOT_VALID_APK";
-
-    /** 校验下载的 APK:包名/版本/签名,全部通过返回 null;文件不是有效 APK 返回 NOT_VALID_APK 前缀(可换源);
-     *  其余为内容不符(包名/版本/签名),返回中文原因(应阻断) */
-    private String verifyApk(String path) {
-        try {
-            PackageManager pm = getPackageManager();
-            int flags = Build.VERSION.SDK_INT >= 28
-                    ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
-            PackageInfo info = pm.getPackageArchiveInfo(path, flags);
-            if (info == null) {
-                return NOT_VALID_APK;
-            }
-            if (!getPackageName().equals(info.packageName)) {
-                return "包名不一致(实际为 " + info.packageName + ")";
-            }
-            long remoteVc = Build.VERSION.SDK_INT >= 28
-                    ? info.getLongVersionCode() : (long) info.versionCode;
-            if (remoteVc <= appVersionCode()) {
-                return "版本不高于当前已安装版本";
-            }
-            Signature[] got = Build.VERSION.SDK_INT >= 28 && info.signingInfo != null
-                    ? info.signingInfo.getApkContentsSigners() : info.signatures;
-            if (!sameSignatures(got, ownSignatures())) {
-                return "签名与已安装版本不一致";
-            }
-            return null;
-        } catch (Exception e) {
-            // 解析过程出错(文件损坏等):按无效包处理,换源重试
-            return NOT_VALID_APK;
-        }
-    }
-
-    private Signature[] ownSignatures() {
-        if (ownSignatures == null) {
-            try {
-                int flags = Build.VERSION.SDK_INT >= 28
-                        ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
-                PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), flags);
-                ownSignatures = Build.VERSION.SDK_INT >= 28 && info.signingInfo != null
-                        ? info.signingInfo.getApkContentsSigners() : info.signatures;
-            } catch (Exception e) {
-                ownSignatures = new Signature[0];
-            }
-        }
-        return ownSignatures;
-    }
-
-    /** 签名集合比对(debug 包只有一个签名;用集合比较兼容多签名/v2 签名方案) */
-    private boolean sameSignatures(Signature[] a, Signature[] b) {
-        if (a == null || b == null || a.length == 0 || a.length != b.length) {
-            return false;
-        }
-        Set<String> set = new HashSet<>();
-        for (Signature s : a) {
-            set.add(s.toCharsString());
-        }
-        for (Signature s : b) {
-            if (!set.contains(s.toCharsString())) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /** 验签通过:有安装权限直接装;没有就先引导授权,文件留着,授权回前台后续装(不再重新下载) */
-    private void proceedToInstall(long downloadId) {
-        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
-            pendingInstallDownloadId = downloadId;
-            new AlertDialog.Builder(this)
-                    .setTitle("需要安装权限")
-                    .setMessage("安装更新前需允许本应用\"安装未知应用\"(只需授权一次)。\n\n授权后回到本 App 会自动继续安装,无需重新下载。")
-                    .setPositiveButton("去授权", (d, w) -> {
-                        try {
-                            startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                    Uri.parse("package:" + getPackageName())));
-                        } catch (Exception e) {
-                            pendingInstallDownloadId = -1L;
-                            toast("无法打开授权设置");
-                        }
-                    })
-                    .setNegativeButton("以后再说", (d, w) -> pendingInstallDownloadId = -1L)
-                    .setOnCancelListener(d -> pendingInstallDownloadId = -1L)
-                    .show();
-            return;
-        }
-        launchInstaller(downloadId);
-    }
-
-    private void launchInstaller(long downloadId) {
-        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-        Uri uri = dm.getUriForDownloadedFile(downloadId);
-        if (uri == null) {
-            new AlertDialog.Builder(this)
-                    .setTitle("安装失败")
-                    .setMessage("安装包文件已不存在(可能被系统清理),请重新检查更新下载。")
-                    .setPositiveButton("知道了", null)
-                    .show();
-            return;
-        }
-        Intent intent = new Intent(Intent.ACTION_VIEW);
-        intent.setDataAndType(uri, "application/vnd.android.package-archive");
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-        try {
-            startActivity(intent);
-        } catch (Exception e) {
-            toast("无法启动安装界面");
-        }
-    }
-
-    /** 从"安装未知应用"授权设置回到前台:权限已给且有待装包,直接续装 */
-    private void maybeResumeInstallAfterPermission() {
-        if (pendingInstallDownloadId < 0) {
-            return;
-        }
-        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
-            return;
-        }
-        long id = pendingInstallDownloadId;
-        pendingInstallDownloadId = -1L;
-        toast("已获得安装权限,继续安装…");
-        launchInstaller(id);
     }
 
     private void toast(String msg) {
@@ -1930,32 +1639,38 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        // 设置页等覆盖层优先:返回即回到会话层(秒回),而不是退出 App;错误页覆盖层仍走退出确认
+        // Android 12 及以下的返回路径;13+ 由 registerBackCallback 注册的 OnBackInvokedCallback 接管
+        if (!handleBack()) {
+            super.onBackPressed();
+        }
+    }
+
+    /**
+     * 统一的返回语义:设置页等覆盖层优先(返回=回会话秒回,不退出);错误页覆盖层走退出确认。
+     * 返回 true 表示已消费;false 表示应退出 Activity。
+     */
+    private boolean handleBack() {
         if (overlayView != null && !onErrorPage) {
             removeOverlay();
-            return;
+            return true;
         }
         if (!onErrorPage && webView != null && webView.canGoBack()) {
             webView.goBack();
-            return;
+            return true;
         }
         long now = System.currentTimeMillis();
         if (now - lastBackTime < 2000L) {
-            super.onBackPressed();
-        } else {
-            lastBackTime = now;
-            Toast.makeText(this, "再按一次退出 ZCode Remote", Toast.LENGTH_SHORT).show();
+            return false;
         }
+        lastBackTime = now;
+        Toast.makeText(this, "再按一次退出 ZCode Remote", Toast.LENGTH_SHORT).show();
+        return true;
     }
 
     @Override
     protected void onDestroy() {
-        dismissUpdateDialog();
+        updater.onDestroy();
         dismissMenu();
-        try {
-            unregisterReceiver(downloadDone);
-        } catch (Exception ignored) {
-        }
         if (clipListener != null) {
             try {
                 ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
