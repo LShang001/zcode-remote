@@ -48,7 +48,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 
 1. **壳的本分** — 网页内的功能与 UI 归 ZCode 官方;壳只做装载、链接管理和移动体验,增强走系统能力(下载管理、外链跳浏览器),保持不注入 CSS/JS 改网页(会随网页更新碎掉)
 2. **极简优先** — 逻辑收进 MainActivity(扫码独立成 ScanActivity,更新链路独立成 Updater),UI 用代码构建;第三方依赖目前仅 zxing:core 一个纯 Java 库(解码+编码会话码都用它);每加一个依赖先问能不能不加(扫码用 core+Camera1 而非 zxing-android-embedded 全家桶就是这个原则)
-3. **发版四同步** — `versionCode` +1、`versionName`、GitHub Release(tag `vX.Y` + 上传 APK),一次发版三处同改;界面显示的版本号运行时读 PackageInfo,无需人肉同步;漏发 Release 等于用户永远收不到更新
+3. **发版四同步** — `versionCode` +1、`versionName`、GitHub Release(tag `vX.Y` + 上传 APK),一次发版三处同改;界面显示的版本号运行时读 PackageInfo,无需人肉同步;漏发 Release 等于用户永远收不到更新。**升级功能验证通过后主动发版,不用问**(来源:2026-09-08 用户指定"以后升级验证好了就主动发版";此前 2026-09-04~09-07 的"等用户说发布"规则作废)
 4. **眼见为实** — 改 UI 后在模拟器跑起来截图,用 Read 亲眼看图确认才算完成
 
 ## 边界
