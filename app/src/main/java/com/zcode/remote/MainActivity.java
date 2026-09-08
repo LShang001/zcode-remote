@@ -22,6 +22,7 @@ import android.os.CancellationSignal;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -79,6 +80,7 @@ public class MainActivity extends Activity {
     private static final String KEY_FAB_Y = "fab_y";
     private static final String KEY_SHOW_FAB = "show_fab";
     private static final String KEY_APP_LOCK = "app_lock";
+    private static final String KEY_ZOOM = "zoom_scale";
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final String ACTION_SCAN_BIND = "com.zcode.remote.SCAN_BIND";
     private static final String ACTION_OPEN_SESSION = "com.zcode.remote.OPEN_SESSION";
@@ -97,6 +99,10 @@ public class MainActivity extends Activity {
     private static final int REQ_FILE = 1;
     private static final int REQ_SCAN = 2;
     private static final int REQ_NOTIF = 3;
+    // 页面缩放:zoomFactor 是"相对页面自然缩放的倍数"(1.0=原始大小),范围与步进
+    private static final float ZOOM_MIN = 0.5f;
+    private static final float ZOOM_MAX = 3.0f;
+    private static final float ZOOM_STEP = 1.25f;
 
     private FrameLayout root;
     private WebView webView;
@@ -113,6 +119,14 @@ public class MainActivity extends Activity {
     private String lastAdoptedClip;
     private TextView fab;
     private AlertDialog menuDialog;
+    // 页面缩放:zoomFactor 是用户选定的倍数(相对页面自然缩放,1.0=原始大小),持久化;
+    // naturalScale 是本页未缩放时的基准缩放,只在 WebView 全新时测一次(重载后 getScale
+    // 已是缩放值,重测会叠乘);restoringZoom 期间忽略 WebView 自身回传的 onScaleChanged,
+    // 否则程序化 zoomBy 的回调会覆盖用户选择
+    private float zoomFactor = 1f;
+    private float naturalScale = 0f;
+    private boolean restoringZoom = false;
+    private TextView zoomLabel;
     private long lastBackTime = 0L;
     private ConnectivityManager.NetworkCallback networkCallback;
     private boolean onErrorPage = false;
@@ -604,6 +618,8 @@ public class MainActivity extends Activity {
         progress = null;
         fab = null;
         sessionView = null;
+        zoomLabel = null;
+        naturalScale = 0f;
     }
 
     /** 把设置/错误页作为覆盖层叠在会话层之上;会话层(WebView)原样保留,秒回靠它 */
@@ -695,6 +711,11 @@ public class MainActivity extends Activity {
         s.setTextZoom(100);
         s.setUseWideViewPort(true);
         s.setLoadWithOverviewMode(true);
+        // 页面缩放:setBuiltInZoomControls 默认 false,不开双指捏合完全无效;
+        // 同时关掉已废弃的屏幕 +/− 浮层按钮,交互只用捏合 + 菜单里的缩放行
+        s.setSupportZoom(true);
+        s.setBuiltInZoomControls(true);
+        s.setDisplayZoomControls(false);
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 
@@ -710,6 +731,31 @@ public class MainActivity extends Activity {
                 }
                 openExternal(uri);
                 return true;
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                // 重载/换链后 WebView 会保留上一次的缩放,getScale() 拿到的是"已缩放"的值,
+                // 所以 naturalScale 只在 WebView 全新时测一次(buildSessionView 置 0),
+                // 这里绝不重置——否则每次刷新都把基准当成已缩放值,倍数被反复叠乘。
+                applyZoomNow();
+            }
+
+            /**
+             * 用户捏合改变了缩放:折算成倍数存下来,换页/重载后仍生效。
+             * restoringZoom 期间是程序化 zoomBy 的回调,不能当作捏合处理。
+             */
+            @Override
+            public void onScaleChanged(WebView view, float oldScale, float newScale) {
+                if (restoringZoom || naturalScale <= 0f || newScale <= 0f) {
+                    return;
+                }
+                float f = clampZoom(newScale / naturalScale);
+                if (Math.abs(f - zoomFactor) > 0.02f) {
+                    zoomFactor = f;
+                    saveZoom();
+                    updateZoomLabel();
+                }
             }
 
             @Override
@@ -880,6 +926,8 @@ public class MainActivity extends Activity {
         // 固定在 root 最底层(index 0):设置/错误覆盖层无论何时添加都在其上
         root.addView(sessionView, 0, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        zoomFactor = clampZoom(getPreferences(Context.MODE_PRIVATE).getFloat(KEY_ZOOM, 1f));
+        naturalScale = 0f;
         webView.loadUrl(url);
     }
 
@@ -1028,6 +1076,28 @@ public class MainActivity extends Activity {
             }
         }));
 
+        box.addView(panelHeader("页面缩放"));
+        LinearLayout zoomHead = new LinearLayout(this);
+        zoomHead.setOrientation(LinearLayout.HORIZONTAL);
+        zoomHead.setGravity(Gravity.CENTER_VERTICAL);
+        TextView zoomHint = new TextView(this);
+        zoomHint.setText("当前");
+        zoomHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        zoomHint.setTextColor(FG_DIM);
+        zoomHead.addView(zoomHint, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        zoomLabel = new TextView(this);
+        zoomLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        zoomLabel.setTextColor(ACCENT);
+        zoomHead.addView(zoomLabel);
+        zoomHead.setPadding(0, dp(2), 0, dp(2));
+        box.addView(zoomHead);
+        updateZoomLabel();
+
+        box.addView(panelRow("＋", "放大", "把网页内容放大一档(也可双指捏合)", v -> stepZoom(ZOOM_STEP)));
+        box.addView(panelRow("－", "缩小", "把网页内容缩小一档(也可双指捏合)", v -> stepZoom(1f / ZOOM_STEP)));
+        box.addView(panelRow("⟲", "重置缩放", "恢复网页原始大小(100%)", v -> resetZoom()));
+
         box.addView(panelHeader("工具"));
         box.addView(panelRow("✕", "清除网页数据", "解决网页卡死或状态错乱(清 Cookie/缓存)", v -> confirmClearData()));
         box.addView(panelRow("ⓘ", "关于本应用", "版本信息与使用说明", v -> showAbout(url)));
@@ -1054,11 +1124,97 @@ public class MainActivity extends Activity {
     }
 
     private void dismissMenu() {
+        zoomLabel = null;
         if (menuDialog != null && menuDialog.isShowing()) {
             try {
                 menuDialog.dismiss();
             } catch (Exception ignored) {
             }
+        }
+    }
+
+    /**
+     * 页面缩放。远程网页自带 `width=device-width, initial-scale=1` 的 viewport meta,
+     * 而 setInitialScale 官方只对"没有 viewport meta 的页面"生效,所以不用它:
+     * 页面加载完成后按倍数调 zoomBy,倍数相对本页未缩放时的基准缩放 naturalScale。
+     *
+     * 注意 getScale() 返回的是"含设备像素密度"的绝对值(模拟器上 2.625),不是 1.0,
+     * 所以必须用 naturalScale 做基准、只按倍数换算,不能直接拿百分比当 scale 用。
+     * zoomBy 在 onPageFinished 刚回调时经常静默无效(内核布局未稳定),故发完延迟校验,
+     * 没到位就重试,最多 6 次。
+     */
+    private void applyZoomNow() {
+        applyZoomNow(0);
+    }
+
+    private void applyZoomNow(int attempt) {
+        if (webView == null) {
+            return;
+        }
+        float cur = webView.getScale();
+        if (cur <= 0f) {
+            if (attempt < 10) {
+                webView.postDelayed(() -> applyZoomNow(attempt + 1), 120);
+            }
+            return;
+        }
+        if (naturalScale <= 0f) {
+            naturalScale = cur;
+        }
+        float target = naturalScale * zoomFactor;
+        if (Math.abs(target - cur) > 0.01f) {
+            restoringZoom = true;
+            webView.zoomBy(target / cur);
+            webView.postDelayed(() -> restoringZoom = false, 300);
+            // 校验是否真的生效:onPageFinished 刚回调时内核布局未稳定,zoomBy 常被静默吞掉,
+            // 没到位就重试(上限 6 次)。TAG=ZCodeZoom 只在这条异常路径打点,便于日后排查
+            if (attempt < 6) {
+                webView.postDelayed(() -> {
+                    if (webView != null && Math.abs(webView.getScale() - target) > 0.05f) {
+                        Log.i("ZCodeZoom", "zoomBy 未生效,重试 attempt=" + (attempt + 1)
+                                + " cur=" + webView.getScale() + " target=" + target);
+                        applyZoomNow(attempt + 1);
+                    }
+                }, 220);
+            }
+        }
+        updateZoomLabel();
+    }
+
+    /** 相对当前倍数增减一档并立即生效 */
+    private void stepZoom(float factor) {
+        if (webView == null) {
+            return;
+        }
+        zoomFactor = clampZoom(zoomFactor * factor);
+        saveZoom();
+        applyZoomNow();
+        updateZoomLabel();
+    }
+
+    private void resetZoom() {
+        if (webView == null) {
+            return;
+        }
+        zoomFactor = 1f;
+        saveZoom();
+        applyZoomNow();
+        updateZoomLabel();
+        Toast.makeText(this, "已恢复 100%", Toast.LENGTH_SHORT).show();
+    }
+
+    private void saveZoom() {
+        getPreferences(Context.MODE_PRIVATE).edit().putFloat(KEY_ZOOM, zoomFactor).apply();
+    }
+
+    private float clampZoom(float v) {
+        return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, v));
+    }
+
+    /** 菜单里的当前缩放百分比;菜单未展示时静默跳过 */
+    private void updateZoomLabel() {
+        if (zoomLabel != null) {
+            zoomLabel.setText(Math.round(zoomFactor * 100) + "%");
         }
     }
 
@@ -1705,6 +1861,8 @@ public class MainActivity extends Activity {
         private float downX = 0f;
         private float lastDy = 0f;
         private boolean dragging = false;
+        // 双指捏合缩放时手指也会向下移动,必须排除多指手势,否则缩放会误触下拉刷新
+        private boolean multiTouch = false;
 
         RefreshLayout(Context context) {
             super(context);
@@ -1717,8 +1875,17 @@ public class MainActivity extends Activity {
                     downY = ev.getY();
                     downX = ev.getX();
                     dragging = false;
+                    multiTouch = false;
+                    break;
+                case MotionEvent.ACTION_POINTER_DOWN:
+                    // 第二根手指落下:本手势判定为缩放,不再参与下拉刷新
+                    multiTouch = true;
+                    dragging = false;
                     break;
                 case MotionEvent.ACTION_MOVE:
+                    if (multiTouch || ev.getPointerCount() > 1) {
+                        break;
+                    }
                     float dy = ev.getY() - downY;
                     float dx = Math.abs(ev.getX() - downX);
                     // 远程页面内部自滚动,WebView.getScrollY() 恒为 0,不能作为"已在顶部"的判据;
@@ -1736,6 +1903,7 @@ public class MainActivity extends Activity {
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
                     downY = -1f;
+                    multiTouch = false;
                     break;
             }
             return dragging;
@@ -1744,8 +1912,15 @@ public class MainActivity extends Activity {
         @Override
         public boolean onTouchEvent(MotionEvent ev) {
             switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_POINTER_DOWN:
+                    multiTouch = true;
+                    dragging = false;
+                    if (progress != null) {
+                        progress.setVisibility(View.GONE);
+                    }
+                    break;
                 case MotionEvent.ACTION_MOVE:
-                    if (downY >= 0) {
+                    if (downY >= 0 && !multiTouch) {
                         lastDy = ev.getY() - downY;
                     }
                     break;
@@ -1757,10 +1932,12 @@ public class MainActivity extends Activity {
                     }
                     dragging = false;
                     downY = -1f;
+                    multiTouch = false;
                     break;
                 case MotionEvent.ACTION_CANCEL:
                     dragging = false;
                     downY = -1f;
+                    multiTouch = false;
                     if (progress != null) {
                         progress.setVisibility(View.GONE);
                     }

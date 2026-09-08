@@ -14,7 +14,7 @@ ADB="$LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe"
 - AVD `zc`:android-34 google_apis x86_64(可 root),Pixel 6 规格 1080×2400@420,WHPX 加速。
 - AVD `x200`(2026-09-04 建):同镜像,X200 Ultra 近似屏 1260×2808@480、2G 内存;验证大屏布局/悬浮钮安全区时用,加 `-port 5556` 可与 zc 并存。
 - **快照快启**:不要加 `-no-snapshot-save`(实测冷启 19s vs 快照 4s);`adb emu kill` 退出即自动存快照;只有要干净冷启动时才加 `-no-snapshot-save`(彻底重置用 `-wipe-data`)。
-- 收尾时**主动询问用户是否关闭模拟器**(见 AGENTS.md §命令 模拟器收尾规约);关闭用 `adb emu kill`。
+- 收尾时**直接关掉,不要问**(见 AGENTS.md §命令 模拟器收尾规约):`adb emu kill`,再用 `adb devices` 确认清空。
 
 ## 装包、启动、截图
 
@@ -34,8 +34,9 @@ sleep 4
 5. **桌面图标**(`input keyevent KEYCODE_HOME` 后截图)——对照 `review-launcher.png`
 6. **会话秒回**(v2.4 加入):会话页先滑动到中部截图 → ⋮ → 更换链接 → 「返回会话」→ **0.4s 内再截图**,两图滚动位置应像素级一致、无进度条;设置页按返回键也应回会话而非退出
 7. **扫码快捷方式**(v2.4 加入):`am start -n com.zcode.remote/.MainActivity -a com.zcode.remote.SCAN_BIND` → ScanActivity 在前台 → 返回取消 → 回到会话页(不白屏)
+8. **页面缩放**(v2.8 加入):⋮ → 滚到底部「页面缩放」区,「当前」百分比应显示;点「放大」两档页面应肉眼变大、标签 100%→156%;「重置缩放」回到 100% 且页面恢复原样;冷启动后百分比应保持。真捏合手势只能 `sendevent` 合成(`input swipe` 无效),详见 AGENTS.md 踩坑记录
 
-> 点菜单项/对话框按钮**用 `uiautomator dump /sdcard/ui.xml` 查 bounds 取中心**,别硬编码坐标:菜单头部"当前会话"的 URL 长短会改变菜单高度,真实 208 字符链接让菜单项整体下移约 120px,旧坐标会点错项。
+> 点菜单项/对话框按钮**用 `uiautomator dump /sdcard/ui.xml` 查 bounds 取中心**,别硬编码坐标:菜单头部"当前会话"的 URL 长短会改变菜单高度,真实 208 字符链接让菜单项整体下移约 120px,旧坐标会点错项。菜单可滚动,底部条目要先把菜单滚下去再 dump。
 
 ## 预置链接(adb root,免手输)
 

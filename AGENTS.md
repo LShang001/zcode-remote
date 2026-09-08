@@ -31,13 +31,13 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 "$LOCALAPPDATA/Android/Sdk/emulator/emulator.exe" -avd zc -no-boot-anim -gpu swiftshader_indirect &
 ```
 
-**模拟器收尾规约**:android-emulator 插件用完从不自动关(设计如此,复用热机),遗留进程会一直吃 2-3GB 内存——凡本次任务用过模拟器,收尾时必须**主动询问用户"模拟器要关掉吗"**:答关 → 停止该模拟器并用 `adb devices` 确认清空;答留 → 保持热机不动。只关自己用过的那台(serial 对得上),不动其他设备(来源:2026-09-04 用户指定,起因是遗留进程挂了数小时未被发现)
+**模拟器收尾规约**:android-emulator 插件用完从不自动关(设计如此,复用热机),遗留进程会一直吃 2-3GB 内存——**凡本次任务用过模拟器,收尾必须直接关掉,不要问**:`adb emu kill` 后用 `adb devices` 确认清空、`tasklist | grep -i emulator` 确认无残留进程。只关自己用过的那台(serial 对得上),不动其他设备。(来源:2026-09-04 用户指定"先问";2026-09-08 用户改为"以后记得关,用完就关"——免去每轮询问)
 
 ## 关键路径
 
 | 路径 | 为什么必须知道 |
 |------|---------------|
-| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、历史会话、应用锁、会话码等逻辑与 UI 都在这(约 1700 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页 |
+| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、历史会话、应用锁、会话码、页面缩放等逻辑与 UI 都在这(约 1750 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页 |
 | `app/src/main/java/com/zcode/remote/Updater.java` | 版本自动更新全链路(v2.6 从 MainActivity 拆出):GitHub Releases 检查、镜像轮换下载、进度轮询、APK 验签、安装引导,状态机与阈值全在此类;MainActivity 只持有 `updater` 实例做委托 |
 | `app/src/main/java/com/zcode/remote/ScanActivity.java` | 扫码绑定页:Camera1 预览 + zxing core 解码,识别远程二维码回传链接给 MainActivity |
 | `gradle.properties` | `android.overridePathCheck=true` 支撑着中文路径构建,删了构建必挂 |
@@ -97,6 +97,14 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - 动态快捷方式(`ShortcutManager.setDynamicShortcuts`)只在 recordHistory 调用链里刷新的话,**从持久化 prefs 恢复的历史不会同步**(启动路径不经过 recordHistory)——onCreate 需补一次同步;注册情况用 `adb shell dumpsys shortcut` 查(来源:2026-09-07 v2.6 模拟器实测)
 - 模拟器默认未录指纹/人脸,`BiometricManager.canAuthenticate()` 返回 NONE_ENROLLED:应用锁在模拟器只能验"无法验证→跳过"降级分支,真认证弹窗要真机验;框架 `android.hardware.biometrics.BiometricPrompt` 为 API 28+,minSdk 26 的两档老系统直接放行不锁死(来源:2026-09-07 v2.6)
 - **Android 14+/targetSdk 34 读 `DownloadManager.COLUMN_LOCAL_FILENAME` 直接抛 SecurityException**(系统提示改用 ContentResolver.openFileDescriptor);吞掉该异常会得到 path=null,更新链路把"下载已完成"误判成"源失败"→换源重下循环→最终报下载失败,而文件其实躺在下载目录(v2.6 真机反馈的原样症状)——验签必须先经 `getUriForDownloadedFile`+`openInputStream` 拷进私有缓存再解析;**完成态(SUCCESSFUL)只允许阻断提示,绝不允许换源重下**;验签各步判定看 logcat TAG=`ZCodeUpdater`(来源:2026-09-07 v2.7 模拟器端到端实测,日志实锤 SecurityException)
+- **WebView 双指捏合缩放要三件套一起开**:`setSupportZoom(true)` + `setBuiltInZoomControls(true)` + `setDisplayZoomControls(false)`。**`setBuiltInZoomControls` 默认 false**——只开 support 不开 builtin,捏合完全无效且无任何报错(壳从 v1.0 到 v2.7 一直是这个状态,来源:2026-09-08 v2.8)
+- **页面缩放别用 `setInitialScale`**:官方文档写明它只对"没有 viewport meta 的页面"生效,而远程页自带 `<meta name="viewport" content="width=device-width, initial-scale=1">`——改用加载完成后按倍数 `WebView.zoomBy()`(来源:2026-09-08 v2.8,AOSP WebView.java javadoc 实查)
+- **`WebView.getScale()` 返回的是含设备像素密度的绝对值,不是 1.0**(模拟器 Pixel6 上为 2.625):算缩放必须记一个"本页未缩放基准"(壳里叫 naturalScale)再乘倍数,把百分比直接当 scale 用会算错(来源:2026-09-08 v2.8 日志实测 cur=2.625)
+- **`zoomBy` 在 `onPageFinished` 刚回调时静默无效**(内核布局未稳定,不抛异常、scale 不动、无日志);同一个调用稍后从菜单点击却正常。必须发完延迟 ~220ms 校验 `getScale()` 是否到位、没到位就重试(来源:2026-09-08 v2.8 实测)
+- **缩放基准不能每次 `onPageFinished` 重测**:重载/换链后 WebView 保留上次缩放,`getScale()` 返回"已缩放"值(实测 4.10),重测基准会让倍数反复叠乘(1.5625 → 页面越来越大)。基准只在 WebView 全新时测一次(来源:2026-09-08 v2.8 实测)
+- **下拉刷新必须排除多指手势**:双指捏合时手指也会向下移动,会被"起点在顶部 1/6 + 下拉 112dp"误判成刷新重连;监听 `ACTION_POINTER_DOWN` 置标志后整体跳过(来源:2026-09-08 v2.8)
+- **模拟器验证缩放/多点手势只能 `sendevent` 合成**:`input tap/swipe` 走输入管理器、绕过 evdev,`getevent` 抓不到也产生不了多点手势。触摸屏是 `virtio_input_multi_touch_1`(`/dev/input/event2`),坐标 0..32767,用 `ABS_MT_SLOT`(47)+`ABS_MT_TRACKING_ID`(57)+`ABS_MT_POSITION_X/Y`(53/54)双槽张开。缩放是否真生效用 PIL 量测试页固定色块的像素宽比肉眼可靠(来源:2026-09-08 v2.8)
+- **模拟器测网页用 `data:text/html,...` 预置 URL**:targetSdk 34 下 `http://127.0.0.1` 明文被拦(错误码 -1),`data:` URL 不受限;带 viewport meta 的本地测试页可完整复现远程页的缩放行为(来源:2026-09-08 v2.8)
 
 ## 知识沉淀协议
 
