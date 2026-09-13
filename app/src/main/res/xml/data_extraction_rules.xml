@@ -1,10 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 12+:不允许云备份,也不允许设备间迁移(远程链接含 sid 凭证) -->
+<!-- Android 12+:不允许云备份,也不允许设备间迁移(远程链接含 sid 凭证)。
+     allowBackup=false 对设备迁移无效(D2D 只看本文件),且各 domain 是并列的独立备份树——
+     只排除 root 不会挡住 shared_prefs(MainActivity.xml 里就是 KEY_URL),必须逐个域排除 -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
     </device-transfer>
 </data-extraction-rules>

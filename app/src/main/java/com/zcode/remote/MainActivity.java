@@ -113,6 +113,8 @@ public class MainActivity extends Activity {
     private View overlayView;
     // WebView 内容是否处于加载失败态:失败后"返回会话"要 reload 而不是只掀掉覆盖层(否则露出内核错误白页)
     private boolean webLoadFailed = false;
+    // 本次主框架导航是否发生过错误(onReceivedError/HttpError),供 onPageFinished 判断能否复位失败标志
+    private boolean mainFrameError = false;
     private ValueCallback<Uri[]> fileCallback;
     private String allowedHost;
     private String loadedUrl;
@@ -140,6 +142,10 @@ public class MainActivity extends Activity {
     // 应用锁:进程存活期间验过一次即可(unlockedThisSession),lockArmed 防 onResume 重入重复弹验证
     private boolean unlockedThisSession = false;
     private boolean lockArmed = false;
+    private CancellationSignal lockCancel;
+    // 延迟弹出的验证任务:onDestroy 要移除,避免销毁后仍弹 BiometricPrompt(窗口泄漏/崩溃)
+    private final Runnable lockRunnable = this::showLock;
+    private AlertDialog qrDialog;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -160,9 +166,11 @@ public class MainActivity extends Activity {
         // 历史可能来自上次会话的持久化(本次启动不一定会走 recordHistory),启动即同步一次快捷方式
         updateDynamicShortcuts();
         route(getIntent());
+        // 上次进程死亡时挂起的更新下载:先对账续上(续轮询/续验签安装),避免更新流静默丢失
+        boolean resumedUpdate = updater.reconcilePending();
         SharedPreferences sp = getPreferences(Context.MODE_PRIVATE);
         // 自动检查节流:距上次检查不足 4 小时则跳过,避免每次冷启动都打 GitHub API
-        if (sp.getBoolean(Updater.KEY_AUTO_UPDATE, true)
+        if (!resumedUpdate && sp.getBoolean(Updater.KEY_AUTO_UPDATE, true)
                 && System.currentTimeMillis() - sp.getLong(Updater.KEY_LAST_UPDATE_CHECK, 0L)
                 >= Updater.UPDATE_CHECK_INTERVAL_MS) {
             updater.checkUpdate(false);
@@ -231,10 +239,14 @@ public class MainActivity extends Activity {
             if (cm == null) {
                 return;
             }
-            networkCallback = new ConnectivityManager.NetworkCallback() {
+                networkCallback = new ConnectivityManager.NetworkCallback() {
                 @Override
                 public void onAvailable(Network network) {
                     runOnUiThread(() -> {
+                        // 回调可能在 Activity 已销毁后才落地:此时重建 WebView 会泄漏且永远不会 destroy
+                        if (isFinishing() || isDestroyed()) {
+                            return;
+                        }
                         if (onErrorPage) {
                             String url = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
                             if (url != null) {
@@ -615,6 +627,11 @@ public class MainActivity extends Activity {
             webView.destroy();
             webView = null;
         }
+        // 会话容器也必须从 root 摘除:渲染进程自愈会重建容器,旧容器若留在 root 里会盖在
+        // 新容器之上,它的 onTouchEvent 恒返回 true 把触摸全部吃掉——页面看起来正常却点不动
+        if (sessionView != null && sessionView.getParent() instanceof ViewGroup) {
+            ((ViewGroup) sessionView.getParent()).removeView(sessionView);
+        }
         progress = null;
         fab = null;
         sessionView = null;
@@ -651,6 +668,9 @@ public class MainActivity extends Activity {
         try {
             if ("intent".equals(uri.getScheme())) {
                 Intent intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME);
+                // 防 intent:// 组件劫持:清掉网页可指定的 component/selector,只按 package/scheme 交系统解析
+                intent.setComponent(null);
+                intent.setSelector(null);
                 try {
                     startActivity(intent);
                     return;
@@ -734,7 +754,18 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                // 每次主框架导航开始都重置错误标记,onPageFinished 据此决定能否清 webLoadFailed
+                mainFrameError = false;
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
+                // 加载成功(本次导航没有主框架错误)即复位失败标志,否则"失败→刷新成功"之后
+                // 标志一直挂着,下次返回会话会白重载一次、丢滚动位置
+                if (!mainFrameError) {
+                    webLoadFailed = false;
+                }
                 // 重载/换链后 WebView 会保留上一次的缩放,getScale() 拿到的是"已缩放"的值,
                 // 所以 naturalScale 只在 WebView 全新时测一次(buildSessionView 置 0),
                 // 这里绝不重置——否则每次刷新都把基准当成已缩放值,倍数被反复叠乘。
@@ -761,6 +792,7 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (request.isForMainFrame()) {
+                    mainFrameError = true;
                     int code = error.getErrorCode();
                     String msg;
                     if (code == WebViewClient.ERROR_HOST_LOOKUP || code == WebViewClient.ERROR_CONNECT
@@ -778,6 +810,7 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
                 if (request.isForMainFrame()) {
+                    mainFrameError = true;
                     int sc = errorResponse.getStatusCode();
                     String msg = (sc == 404 || sc == 410)
                             ? "会话链接已失效(HTTP " + sc + "),请在电脑端重新生成远程链接。"
@@ -844,27 +877,30 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPermissionRequest(final PermissionRequest request) {
-                // 远程网页可能请求麦克风/摄像头(语音/视频类功能):有对应系统权限就授予,没有则拒绝。
-                // 不主动申请权限——保持壳的本分,需要的用户在系统设置里给过即生效
+                // 只处理摄像头:麦克风(Manifest 未声明 RECORD_AUDIO,保持最小权限)一律拒绝。
+                // 摄像头也不能静默放行——WebView 默认行为就是拒绝,壳保持这一点,必须用户确认后才授予,
+                // 否则远程页(或其加载的第三方脚本)可无感开启摄像头
                 runOnUiThread(() -> {
-                    String[] wanted = request.getResources();
-                    List<String> grant = new ArrayList<>();
-                    for (String res : wanted) {
-                        if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(res)
-                                && checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                                == PackageManager.PERMISSION_GRANTED) {
-                            grant.add(res);
-                        } else if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(res)
+                    boolean wantsVideo = false;
+                    for (String res : request.getResources()) {
+                        if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(res)
                                 && checkSelfPermission(Manifest.permission.CAMERA)
                                 == PackageManager.PERMISSION_GRANTED) {
-                            grant.add(res);
+                            wantsVideo = true;
                         }
                     }
-                    if (grant.isEmpty()) {
+                    if (!wantsVideo || isFinishing() || isDestroyed()) {
                         request.deny();
-                    } else {
-                        request.grant(grant.toArray(new String[0]));
+                        return;
                     }
+                    new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("网页请求使用摄像头")
+                            .setMessage("当前网页请求开启摄像头。是否允许?")
+                            .setPositiveButton("允许", (d, w) -> request.grant(
+                                    new String[]{PermissionRequest.RESOURCE_VIDEO_CAPTURE}))
+                            .setNegativeButton("拒绝", (d, w) -> request.deny())
+                            .setOnCancelListener(d -> request.deny())
+                            .show();
                 });
             }
         });
@@ -909,17 +945,19 @@ public class MainActivity extends Activity {
         fab = menuFab();
         fab.setVisibility(prefs.getBoolean(KEY_SHOW_FAB, true) ? View.VISIBLE : View.GONE);
         container.addView(fab, fabLp);
+        // 闭包用局部引用而非字段:自愈/销毁时序下闭包可能在 destroyWeb 置空 fab 之后才执行
+        final TextView fabView = fab;
         container.post(() -> {
             // 换设备/旋转后旧位置可能越界,布局完成时兜底拉回内容区安全边距内(避开状态栏/手势条方向)
-            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) fab.getLayoutParams();
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) fabView.getLayoutParams();
             int padH = dp(12);
             int padTop = dp(8);
             int padBottom = dp(24);
             lp.leftMargin = clamp(lp.leftMargin, padH,
-                    Math.max(padH, container.getWidth() - fab.getWidth() - padH));
+                    Math.max(padH, container.getWidth() - fabView.getWidth() - padH));
             lp.topMargin = clamp(lp.topMargin, padTop,
-                    Math.max(padTop, container.getHeight() - fab.getHeight() - padBottom));
-            fab.setLayoutParams(lp);
+                    Math.max(padTop, container.getHeight() - fabView.getHeight() - padBottom));
+            fabView.setLayoutParams(lp);
         });
 
         sessionView = container;
@@ -1595,18 +1633,32 @@ public class MainActivity extends Activity {
         }
         lockArmed = true;
         // 稍作延迟等窗口 focus 就绪,BiometricPrompt 在 resume 瞬间弹出更稳
-        root.postDelayed(this::showLock, 300);
+        root.postDelayed(lockRunnable, 300);
     }
 
     private void showLock() {
+        if (isFinishing() || isDestroyed()) {
+            lockArmed = false;
+            return;
+        }
         if (Build.VERSION.SDK_INT < 28) {
             // 框架版 BiometricPrompt API 28+;minSdk 26 的两档老系统直接放行(功能降级,不锁死用户)
             lockArmed = false;
             return;
         }
-        BiometricManager bm = getSystemService(BiometricManager.class);
-        int can = bm == null ? BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED : bm.canAuthenticate();
-        if (can != BiometricManager.BIOMETRIC_SUCCESS) {
+        // 注意:BiometricManager 是 API 29 才加入的类(API 28 只有 BiometricPrompt),
+        // 在 Android 9 上直接引用会 NoClassDefFoundError(Error 不是 Exception,catch 兜不住)——
+        // 28 用同能力的 FingerprintManager 做预检
+        boolean canVerify;
+        if (Build.VERSION.SDK_INT >= 29) {
+            BiometricManager bm = getSystemService(BiometricManager.class);
+            canVerify = bm != null && bm.canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS;
+        } else {
+            android.hardware.fingerprint.FingerprintManager fm =
+                    (android.hardware.fingerprint.FingerprintManager) getSystemService(FINGERPRINT_SERVICE);
+            canVerify = fm != null && fm.isHardwareDetected() && fm.hasEnrolledFingerprints();
+        }
+        if (!canVerify) {
             // 没录指纹/人脸或硬件不可用:弹窗说明并给"跳过",避免把自己锁在门外
             lockArmed = false;
             new AlertDialog.Builder(this)
@@ -1624,7 +1676,8 @@ public class MainActivity extends Activity {
                     toast("已跳过本次验证");
                 })
                 .build();
-        prompt.authenticate(new CancellationSignal(), getMainExecutor(),
+        lockCancel = new CancellationSignal();
+        prompt.authenticate(lockCancel, getMainExecutor(),
                 new BiometricPrompt.AuthenticationCallback() {
                     @Override
                     public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
@@ -1690,7 +1743,7 @@ public class MainActivity extends Activity {
         hint.setPadding(0, dp(12), 0, 0);
         box.addView(hint);
 
-        AlertDialog dialog = new AlertDialog.Builder(this)
+        qrDialog = new AlertDialog.Builder(this)
                 .setTitle("会话二维码")
                 .setView(box)
                 .setPositiveButton("关闭", null)
@@ -1702,7 +1755,7 @@ public class MainActivity extends Activity {
         Runnable tick = new Runnable() {
             @Override
             public void run() {
-                if (!dialog.isShowing()) {
+                if (qrDialog == null || !qrDialog.isShowing()) {
                     return;
                 }
                 left[0]--;
@@ -1718,7 +1771,10 @@ public class MainActivity extends Activity {
         };
         hint.setText("链接含会话凭证,请勿外传 · 60 秒后自动遮蔽");
         countdown.postDelayed(tick, 1000);
-        dialog.setOnDismissListener(d -> countdown.removeCallbacks(tick));
+        qrDialog.setOnDismissListener(d -> {
+            countdown.removeCallbacks(tick);
+            qrDialog = null;
+        });
     }
 
     /**
@@ -1807,7 +1863,18 @@ public class MainActivity extends Activity {
      */
     private boolean handleBack() {
         if (overlayView != null && !onErrorPage) {
-            removeOverlay();
+            // 掀覆盖层统一收敛到 showWeb:同链未失败=秒回;上次加载失败=reload(只掀层会露出
+            // 内核错误白页,且清掉 onErrorPage 后网络恢复自动重连也失效);首启没有任何会话层
+            // 可回时交回系统退出,避免留下纯黑空屏
+            String saved = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
+            if (sessionView == null && saved == null) {
+                return false;
+            }
+            if (saved != null) {
+                showWeb(saved);
+            } else {
+                removeOverlay();
+            }
             return true;
         }
         if (!onErrorPage && webView != null && webView.canGoBack()) {
@@ -1827,6 +1894,24 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         updater.onDestroy();
         dismissMenu();
+        // 收尾延迟的验证弹窗:销毁后仍弹会窗口泄漏(BadToken);已弹出的 prompt 取消掉
+        if (root != null) {
+            root.removeCallbacks(lockRunnable);
+        }
+        if (lockCancel != null) {
+            try {
+                lockCancel.cancel();
+            } catch (Exception ignored) {
+            }
+            lockCancel = null;
+        }
+        if (qrDialog != null) {
+            try {
+                qrDialog.dismiss();
+            } catch (Exception ignored) {
+            }
+            qrDialog = null;
+        }
         if (clipListener != null) {
             try {
                 ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);

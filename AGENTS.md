@@ -12,18 +12,21 @@
 ## 命令
 
 ```bash
-# 构建并发版(JDK 已装但不在 PATH,必须先 export)
+# 构建并发版(JDK 已装但不在 PATH,必须先 export)——发版产物用 release 变体(debuggable=false),
+# 签名沿用 debug keystore(老用户已装 debug 签名版本,换签名将无法覆盖安装)
 export JAVA_HOME="C:\\Program Files\\Microsoft\\jdk-17.0.20.8-hotspot"
-/c/Users/12631/.zcode/tools/gradle-8.9/bin/gradle.bat assembleDebug --console=plain
-cp -f app/build/outputs/apk/debug/app-debug.apk ZCodeRemote.apk
+/c/Users/12631/.zcode/tools/gradle-8.9/bin/gradle.bat assembleRelease --console=plain
+cp -f app/build/outputs/apk/release/app-release.apk ZCodeRemote.apk
 ```
 
 ```bash
 # 发 GitHub Release(App 自动更新的检查源,tag 必须 vX.Y 且 asset 为 .apk)
 git add -A && git commit -m "vX.Y: ..." && git push
-cp app/build/outputs/apk/debug/app-debug.apk /tmp/ZCodeRemote-vX.Y.apk
+cp app/build/outputs/apk/release/app-release.apk /tmp/ZCodeRemote-vX.Y.apk
 gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更要点"
 ```
+
+> 模拟器视觉审查用 `assembleDebug`(debuggable 便于 chrome://inspect 与 run-as 预置 prefs);发版一律 release 变体。
 
 ```bash
 # 启动模拟器做视觉审查(AVD:zc=Pixel6 标准屏;x200=X200 Ultra 近似屏 1260x2808@480,加 -port 5556 可并存)
@@ -37,7 +40,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 
 | 路径 | 为什么必须知道 |
 |------|---------------|
-| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、历史会话、应用锁、会话码、页面缩放等逻辑与 UI 都在这(约 1750 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页 |
+| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、历史会话、应用锁、会话码、页面缩放等逻辑与 UI 都在这(约 2000 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页。v2.9 起:**destroyWeb 必须连 sessionView 一起从 root 摘除**(自愈重建时旧容器会留在 root 顶层吃掉全部触摸);handleBack 的掀覆盖层分支统一走 showWeb(错误态 reload、无会话直退) |
 | `app/src/main/java/com/zcode/remote/Updater.java` | 版本自动更新全链路(v2.6 从 MainActivity 拆出):GitHub Releases 检查、镜像轮换下载、进度轮询、APK 验签、安装引导,状态机与阈值全在此类;MainActivity 只持有 `updater` 实例做委托 |
 | `app/src/main/java/com/zcode/remote/ScanActivity.java` | 扫码绑定页:Camera1 预览 + zxing core 解码,识别远程二维码回传链接给 MainActivity |
 | `gradle.properties` | `android.overridePathCheck=true` 支撑着中文路径构建,删了构建必挂 |
@@ -56,7 +59,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 **绝不修改**:
 - `ZCodeRemote.apk` — 发版产物,只能由上面的构建命令覆盖
 - `.gradle/`、`app/build/` — 构建缓存,手改了也会被重建冲掉
-- 签名配置 — 保持 debug 自动签名;换签名会导致用户手机无法覆盖安装
+- 签名配置 — **release 变体也显式 `signingConfig signingConfigs.debug`**,保持 debug 签名;换签名会导致用户手机无法覆盖安装
+- `app/src/main/res/xml/data_extraction_rules.xml` 里的逐个 domain 排除 — 少一个域 sid 凭证就可能随备份/换机外泄(见踩坑记录)
 
 **修改前必须确认**:
 - 升级 AGP(现 8.5.2)/ Gradle(现 8.9)/ compileSdk(现 34)→ 先确认与 JDK 17 及中文路径兼容
@@ -105,6 +109,18 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "变更�
 - **下拉刷新必须排除多指手势**:双指捏合时手指也会向下移动,会被"起点在顶部 1/6 + 下拉 112dp"误判成刷新重连;监听 `ACTION_POINTER_DOWN` 置标志后整体跳过(来源:2026-09-08 v2.8)
 - **模拟器验证缩放/多点手势只能 `sendevent` 合成**:`input tap/swipe` 走输入管理器、绕过 evdev,`getevent` 抓不到也产生不了多点手势。触摸屏是 `virtio_input_multi_touch_1`(`/dev/input/event2`),坐标 0..32767,用 `ABS_MT_SLOT`(47)+`ABS_MT_TRACKING_ID`(57)+`ABS_MT_POSITION_X/Y`(53/54)双槽张开。缩放是否真生效用 PIL 量测试页固定色块的像素宽比肉眼可靠(来源:2026-09-08 v2.8)
 - **模拟器测网页用 `data:text/html,...` 预置 URL**:targetSdk 34 下 `http://127.0.0.1` 明文被拦(错误码 -1),`data:` URL 不受限;带 viewport meta 的本地测试页可完整复现远程页的缩放行为(来源:2026-09-08 v2.8)
+- **`BiometricManager`(`android.hardware.biometrics.BiometricManager`)是 API 29 才加入的类**,API 28 只有 `BiometricPrompt`:showLock 用 `< 28` 做门槛会让 Android 9 直接 NoClassDefFoundError(**Error 不是 Exception,catch 兜不住**)——28 用 `FingerprintManager` 做同能力预检,29+ 才用 BiometricManager(来源:2026-09-14 v2.9 代码审计)
+- **`destroyWeb` 必须把 sessionView 容器也摘出 root,只 destroy WebView 不够**:WebView 从容器摘除后旧 RefreshLayout 仍留在 root,自愈重建的新容器插在 index 0,旧容器在上层先吃 DOWN 事件且其 `onTouchEvent` 恒 `return true`——表现"页面正常但整页点不动、划不动"(只剩 FAB 能用),极具迷惑性(来源:2026-09-14 v2.9 代码审计+自愈实测)
+- **返回键掀覆盖层时必须收敛到 `showWeb(savedUrl)` 而不是裸 `removeOverlay`**:错误页→设置页→按返回键的路径上,只清 `onErrorPage` 会露出 WebView 内核错误白页、且清掉标志后"网络恢复自动重连"也失效;正确语义=同链未失败秒回、同链失败 reload、无会话且从未建过会话层则交回系统退出(否则留下纯黑空屏)(来源:2026-09-14 v2.9 断网实测)
+- **data_extraction_rules 的每个 domain 是并列的独立备份树,`root` 不覆盖 `shared_prefs`**:只排除 root 挡不住 `MainActivity.xml`(sid 就在里面),必须逐域排除 file/database/sharedpref/external(+device_*);另外 **Android 12+ 上 `allowBackup=false` 不停用设备间迁移(D2D)**,规则文件才是唯一防线(来源:2026-09-14 v2.9,官方文档 developer.android.com/identity/data/autobackup 实证)
+- **debug 包不能当正式包发**:debuggable=true 会默认开启 WebView 内容调试(chrome://inspect 可读写远程会话页)且 `adb run-as` 可直读含 sid 的 SharedPreferences。shell 侧自证:`adb shell run-as <pkg>` 报 "package not debuggable" = release 变体已生效(来源:2026-09-14 v2.9)
+- **Camera1 预览回调的 buffer 会被复用**,解码一旦下放工作线程必须先把 ROI 逐行 `System.arraycopy` 成独立数组再交出去,否则解到的是被覆盖的帧;解码线程用单线程 HandlerThread 串行(zxing MultiFormatReader 非线程安全),背压用 `decoding` 标志丢帧(来源:2026-09-14 v2.9)
+- **ScanActivity 的 onPause 释放相机后必须有 onResume 重新 open**:分屏/小窗/相册返回等场景 surface 不重建(surfaceCreated 不再回调),没有 onResume 兜底会"预览定格且永远扫不出"且无任何报错(来源:2026-09-14 v2.9 代码审计)
+- **downloader 进度回退也是"在动"**:断网重连/源不支持 Range 时 DownloadManager 字节会回退,stall 判据用 `done > lastBytes` 刷新时间戳会把健康下载在 60s 后误杀换源——改用 `done != lastBytes`(来源:2026-09-14 v2.9 代码审计)
+- **进度查询查不到条目 ≈ 用户在系统侧取消了下载,不是"源失败"**:绝不能换源重下(会把用户明确的取消动作变成流量消耗),连续两次确认后收尾提示"下载已被取消"(来源:2026-09-14 v2.9 代码审计)
+- **更新流状态要持久化 + 启动对账**:下载中 App 被划掉/进程死亡后 DownloadManager 仍在后台下载,广播是动态注册非粘性,完成事件永久丢失——把 pendingDownloadId/version/url 存 SharedPreferences,onCreate 对账:下载中→续轮询、已完成→问用户是否续装、条目消失→清状态(来源:2026-09-14 v2.9)
+- **`intent://` 外链在 startActivity 前必须 `setComponent(null)` + `setSelector(null)`**:网页可借 `Intent;component=...` 拉起任意 exported 组件携带可控 extras(Chrome 早已修的经典 intent:// 滥用模式)(来源:2026-09-14 v2.9 代码审计)
+- **WebView 的 onPermissionRequest 不要静默授权摄像头**:WebView 默认就是 deny,壳里只要 App 自身持有 CAMERA 就 grant 会让远程页(或其第三方脚本)无感开摄像头——改为每次弹确认框;Manifest 没声明的权限(如 RECORD_AUDIO)检查必然为 denied,对应分支是死代码要删(来源:2026-09-14 v2.9 代码审计)
 
 ## 知识沉淀协议
 

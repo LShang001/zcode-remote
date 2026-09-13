@@ -8,8 +8,18 @@ android {
         applicationId "com.zcode.remote"
         minSdk 26
         targetSdk 34
-        versionCode 19
-        versionName "2.8"
+        versionCode 20
+        versionName "2.9"
+    }
+
+    buildTypes {
+        // 发版走 release:debuggable=false —— debug 包会开 WebView 内容调试(chrome://inspect 可读写
+        // 远程会话页)且 adb run-as 可直读 SharedPreferences 里的 sid,不该当正式包发。
+        // 签名沿用 debug keystore:老用户已装 debug 签名版本,换签名会导致无法覆盖安装
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
     }
 
     compileOptions {

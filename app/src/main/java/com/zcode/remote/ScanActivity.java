@@ -2,6 +2,7 @@ package com.zcode.remote;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -15,6 +16,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Vibrator;
 import android.os.VibratorManager;
@@ -71,6 +73,14 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     private long lastDecode;
     private int previewW;
     private int previewH;
+    // 解码工作线程:预览回调与相册选图都在主线程触发,密集码解码单帧就要几十到几百毫秒,
+    // 留在主线程会掉帧、大图卡到 ANR;主线程只做 ROI 拷贝与状态回写
+    private HandlerThread decodeThread;
+    private Handler decodeHandler;
+    private volatile boolean decoding = false;
+    // 相册图过大导致 OOM 时给专门提示,而不是笼统说"没识别到"(工作线程写、主线程读)
+    private volatile boolean galleryOom = false;
+    private AlertDialog cameraErrorDialog;
     // 取景框引用,用于识别状态变色;状态防止"非远程二维码"Toast 每帧刷屏
     private View frameBox;
     private GradientDrawable frameDrawable;
@@ -96,6 +106,11 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         hints.put(DecodeHintType.POSSIBLE_FORMATS, formats);
         hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
         reader.setHints(hints);
+
+        // 解码工作线程(multi 格式 reader 非线程安全,预览与相册解码都串行在这一个线程上)
+        decodeThread = new HandlerThread("qr-decode");
+        decodeThread.start();
+        decodeHandler = new Handler(decodeThread.getLooper());
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xFF000000);
@@ -169,7 +184,10 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         gbg.setCornerRadius(dp(8));
         gallery.setBackground(gbg);
         gallery.setOnClickListener(v -> openGallery());
-        LinearLayout.LayoutParams gLp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        // 不锁死 44dp:系统大字体下文字会被裁,minHeight 48dp 同时保证触摸目标达标
+        gallery.setMinHeight(dp(48));
+        LinearLayout.LayoutParams gLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         gLp.rightMargin = dp(10);
         btns.addView(gallery, gLp);
 
@@ -183,7 +201,9 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         cbg.setCornerRadius(dp(8));
         cancel.setBackground(cbg);
         cancel.setOnClickListener(v -> finish());
-        LinearLayout.LayoutParams cLp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        cancel.setMinHeight(dp(48));
+        LinearLayout.LayoutParams cLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         cLp.leftMargin = dp(10);
         btns.addView(cancel, cLp);
 
@@ -207,8 +227,8 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 initCamera();
             } else {
-                Toast.makeText(this, "需要相机权限才能扫码", Toast.LENGTH_LONG).show();
-                finish();
+                // 不再直接关页:相册选图不依赖相机权限,给用户留一条可用路径
+                showCameraDeniedDialog();
             }
         }
     }
@@ -221,6 +241,18 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceChanged(SurfaceHolder h, int format, int width, int height) {
+        // surface 尺寸就绪后按预览宽高比留边显示,避免全屏拉伸把 QR 模块拉成非正方形
+        fitSurfaceToPreview();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // onPause 释放了相机,但分屏/小窗/相册返回等场景 surface 不会重建(surfaceCreated 不再回调),
+        // 没有这里会出现"预览定格/黑屏且永远扫不出",只能退出重进
+        if (!decoded && hasSurface) {
+            initCamera();
+        }
     }
 
     @Override
@@ -276,68 +308,186 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
                 params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
             }
             camera.setParameters(params);
+            // 回读实际生效的预览尺寸:HAL 未必采纳请求值,按实际值解码才不会拿错 stride
+            Camera.Size actual = camera.getParameters().getPreviewSize();
+            if (actual != null && actual.width > 0 && actual.height > 0) {
+                previewW = actual.width;
+                previewH = actual.height;
+            }
             camera.setDisplayOrientation(90);
             camera.setPreviewDisplay(holder);
             camera.setPreviewCallback((data, c) -> onPreviewFrame(data, c));
             camera.startPreview();
+            fitSurfaceToPreview();
         } catch (Exception e) {
-            Toast.makeText(this, "无法打开相机: " + e.getMessage(), Toast.LENGTH_LONG).show();
-            finish();
+            // 不再直接关页:无摄像头设备/相机被别的应用占用时,相册选图仍然可用
+            releaseCamera();
+            showCameraErrorDialog(e);
+        }
+    }
+
+    /** 预览按 buffer 宽高比居中留边显示(竖屏下宽高比 = 短边/长边),消除全屏拉伸造成的模块变形 */
+    private void fitSurfaceToPreview() {
+        if (surface == null || previewW <= 0 || previewH <= 0) {
+            return;
+        }
+        View parent = (View) surface.getParent();
+        if (parent == null) {
+            return;
+        }
+        int vw = parent.getWidth();
+        int vh = parent.getHeight();
+        if (vw <= 0 || vh <= 0) {
+            parent.post(this::fitSurfaceToPreview);
+            return;
+        }
+        float aspect = Math.min(previewW, previewH) / (float) Math.max(previewW, previewH);
+        int tw = vw;
+        int th = Math.round(vw / aspect);
+        if (th > vh) {
+            th = vh;
+            tw = Math.round(vh * aspect);
+        }
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) surface.getLayoutParams();
+        if (lp.width == tw && lp.height == th) {
+            return;
+        }
+        surface.setLayoutParams(new FrameLayout.LayoutParams(tw, th, Gravity.CENTER));
+    }
+
+    /** 相机打不开(无硬件/被占用/权限)时的可操作提示:保留相册入口与重试,不再一关了之 */
+    private void showCameraErrorDialog(Exception e) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        // onResume/重试会再次进入这里,先收掉上一个,避免对话框叠加
+        if (cameraErrorDialog != null && cameraErrorDialog.isShowing()) {
+            try {
+                cameraErrorDialog.dismiss();
+            } catch (Exception ignored) {
+            }
+        }
+        String detail = e == null || e.getMessage() == null ? "" : "(" + e.getMessage() + ")";
+        cameraErrorDialog = new AlertDialog.Builder(this)
+                .setTitle("无法使用相机" + detail)
+                .setMessage("相机可能被其他应用占用或设备没有可用摄像头。\n\n你仍然可以使用「相册选图」识别二维码截图。")
+                .setPositiveButton("重试", (d, w) -> initCamera())
+                .setNeutralButton("用相册选图", (d, w) -> openGallery())
+                .setNegativeButton("取消", (d, w) -> finish())
+                .show();
+    }
+
+    /** 相机权限被拒:区分"可再申请"与"已永久拒绝",永久拒绝给去系统设置的入口 */
+    private void showCameraDeniedDialog() {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        final boolean canAskAgain = shouldShowRequestPermissionRationale(Manifest.permission.CAMERA);
+        new AlertDialog.Builder(this)
+                .setTitle("需要相机权限")
+                .setMessage(canAskAgain
+                        ? "扫码需要相机权限,请允许。\n\n也可以直接用「相册选图」识别二维码截图。"
+                        : "相机权限已被拒绝。可在系统设置中重新开启,或直接用「相册选图」识别二维码截图。")
+                .setPositiveButton(canAskAgain ? "重新申请" : "去设置", (d, w) -> {
+                    if (canAskAgain) {
+                        requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
+                    } else {
+                        openAppSettings();
+                    }
+                })
+                .setNeutralButton("用相册选图", (d, w) -> openGallery())
+                .setNegativeButton("取消", (d, w) -> finish())
+                .show();
+    }
+
+    private void openAppSettings() {
+        try {
+            startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            Toast.makeText(this, "无法打开系统设置", Toast.LENGTH_SHORT).show();
         }
     }
 
     private void onPreviewFrame(byte[] data, Camera c) {
-        if (decoded) {
+        if (decoded || decoding || decodeHandler == null) {
             return;
         }
         long now = System.currentTimeMillis();
-        if (now - lastDecode < 180) {
+        // 轻量节流:解码背压主要靠 decoding 标志,这里只避免空队列也高频入队
+        if (now - lastDecode < 120) {
             return;
         }
         lastDecode = now;
-        String text = null;
-        try {
-            int w = previewW;
-            int h = previewH;
-            if (w <= 0 || h <= 0) {
-                Camera.Size sz = c.getParameters().getPreviewSize();
-                w = sz.width;
-                h = sz.height;
-                previewW = w;
-                previewH = h;
+        int w = previewW;
+        int h = previewH;
+        if (w <= 0 || h <= 0) {
+            Camera.Size sz = c.getParameters().getPreviewSize();
+            if (sz == null || sz.width <= 0 || sz.height <= 0) {
+                return;
             }
-            // 直接用相机缓冲的 Y 平面解码,不做像素旋转:QR 码有三个定位符,
-            // zxing 原生支持任意朝向(JVM 已验证 0/90/180/270° 均可直解),
-            // 每帧省掉 w*h 次像素循环与一次整块分配
-            // 取画面中心 70% 区域送解:二维码对准取景框时占比更大,减少边缘干扰
-            int cropW = w * 7 / 10;
-            int cropH = h * 7 / 10;
-            int left = (w - cropW) / 2;
-            int top = (h - cropH) / 2;
-            PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(
-                    data, w, h, left, top, cropW, cropH, false);
-            Result result = decodeWithFallback(source);
-            if (result != null) {
-                text = result.getText();
-            }
-        } catch (Exception ignored) {
-            // 这一帧没解出二维码,继续等下一帧
-        } finally {
-            try {
-                reader.reset();
-            } catch (Exception ignored) {
-            }
+            w = sz.width;
+            h = sz.height;
+            previewW = w;
+            previewH = h;
         }
-        final String found = text;
-        if (found != null) {
-            Matcher m = REMOTE_URL.matcher(found);
+        // 直接用相机缓冲的 Y 平面解码,不做像素旋转:QR 码有三个定位符,
+        // zxing 原生支持任意朝向(JVM 已验证 0/90/180/270° 均可直解),
+        // 每帧省掉 w*h 次像素循环与一次整块分配;取画面中心 70% 区域送解,减少边缘干扰
+        int cropW = w * 7 / 10;
+        int cropH = h * 7 / 10;
+        int left = (w - cropW) / 2;
+        int top = (h - cropH) / 2;
+        // 相机缓冲会被复用,而解码在工作线程做:必须先把 ROI 逐行拷成连续缓冲再交出去
+        final byte[] roi = new byte[cropW * cropH];
+        for (int row = 0; row < cropH; row++) {
+            System.arraycopy(data, (top + row) * w + left, roi, row * cropW, cropW);
+        }
+        final int rw = cropW;
+        final int rh = cropH;
+        decoding = true;
+        decodeHandler.post(() -> {
+            String found = null;
+            try {
+                PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(
+                        roi, rw, rh, 0, 0, rw, rh, false);
+                Result result = decodeWithFallback(source);
+                if (result != null) {
+                    found = result.getText();
+                }
+            } catch (Exception ignored) {
+                // 这一帧没解出二维码,继续等下一帧
+            } finally {
+                try {
+                    reader.reset();
+                } catch (Exception ignored) {
+                }
+            }
+            final String text = found;
+            mainHandler.post(() -> {
+                decoding = false;
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                handleDecodedText(text);
+            });
+        });
+    }
+
+    /** 解码结果统一回主线程处理:远程链接 → 回传;非远程码 → 提示一次;无码 → 复位状态 */
+    private void handleDecodedText(String text) {
+        if (decoded) {
+            return;
+        }
+        if (text != null) {
+            Matcher m = REMOTE_URL.matcher(text);
             if (m.find()) {
                 returnWithUrl(m.group());
             } else {
                 setMismatchState(true);
             }
         } else if (showingMismatch) {
-            // 从"识别到异物二维码"状态回到"什么都没识别到":恢复蓝色边框,允许再次提示
+            // 从"识别到异物二维码"回到"什么都没识别到":恢复蓝色边框,允许再次提示
             setMismatchState(false);
         }
     }
@@ -359,6 +509,11 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
 
     /** 取景框/Toast 状态:识别到二维码但不是远程链接时边框变红并提示一次;恢复时变回蓝色 */
     private void setMismatchState(final boolean mismatch) {
+        // 状态没变化直接返回:同一张异物二维码在取景框里停留时每帧都会走到这里,
+        // 不短路会以约 5 次/秒的节奏反复弹 Toast(部分被系统限流丢弃,观感像程序失控)
+        if (mismatch == showingMismatch) {
+            return;
+        }
         showingMismatch = mismatch;
         mainHandler.post(() -> {
             if (frameDrawable != null) {
@@ -419,12 +574,30 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_GALLERY && resultCode == RESULT_OK && data != null && data.getData() != null) {
-            String url = decodeGalleryImage(data.getData());
-            if (url != null) {
-                returnWithUrl(url);
-            } else {
-                Toast.makeText(this, "这张图里没识别到有效的 ZCode 远程二维码", Toast.LENGTH_LONG).show();
+            // 大图解码(全尺寸 JPEG 采样解码 + 放大 + 二值化)可能到秒级,必须放工作线程,
+            // 否则主线程冻结,用户以为死机
+            final Uri uri = data.getData();
+            galleryOom = false;
+            if (decodeHandler == null) {
+                return;
             }
+            decoding = true;
+            decodeHandler.post(() -> {
+                final String url = decodeGalleryImage(uri);
+                mainHandler.post(() -> {
+                    decoding = false;
+                    if (isFinishing() || isDestroyed()) {
+                        return;
+                    }
+                    if (url != null) {
+                        returnWithUrl(url);
+                    } else {
+                        Toast.makeText(this, galleryOom
+                                ? "图片太大,无法处理,请换一张较小的截图"
+                                : "这张图里没识别到有效的 ZCode 远程二维码", Toast.LENGTH_LONG).show();
+                    }
+                });
+            });
         }
     }
 
@@ -440,6 +613,10 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
             bounds.inJustDecodeBounds = true;
             try (java.io.InputStream s0 = getContentResolver().openInputStream(uri)) {
                 BitmapFactory.decodeStream(s0, null, bounds);
+            }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                // 尺寸都量不到(bounds 解析失败):不冒险全尺寸解码,直接放弃
+                return null;
             }
             int sample = 1;
             int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
@@ -460,6 +637,13 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
                 url = decodeQrFromBitmap(bmp, true);
             }
             return url;
+        } catch (OutOfMemoryError oom) {
+            // OOM 是 Error 不是 Exception,必须显式兜住:大图 + 放大二值化最坏要几十 MB
+            galleryOom = true;
+            try {
+                reader.reset();
+            } catch (Exception ignored) {
+            }
         } catch (Exception ignored) {
             try {
                 reader.reset();
@@ -565,14 +749,23 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void releaseCamera() {
-        if (camera != null) {
-            try {
-                camera.setPreviewCallback(null);
-                camera.stopPreview();
-                camera.release();
-            } catch (Exception ignored) {
-            }
-            camera = null;
+        Camera c = camera;
+        camera = null;
+        if (c == null) {
+            return;
+        }
+        // 三步各自兜底:stopPreview 在边界状态抛异常时,release 仍必须执行,否则相机被泄漏占用
+        try {
+            c.setPreviewCallback(null);
+        } catch (Exception ignored) {
+        }
+        try {
+            c.stopPreview();
+        } catch (Exception ignored) {
+        }
+        try {
+            c.release();
+        } catch (Exception ignored) {
         }
     }
 
@@ -586,6 +779,18 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     protected void onDestroy() {
         super.onDestroy();
         releaseCamera();
+        if (cameraErrorDialog != null) {
+            try {
+                cameraErrorDialog.dismiss();
+            } catch (Exception ignored) {
+            }
+            cameraErrorDialog = null;
+        }
+        if (decodeThread != null) {
+            decodeThread.quitSafely();
+            decodeThread = null;
+            decodeHandler = null;
+        }
     }
 
     private int dp(int v) {
