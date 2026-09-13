@@ -39,6 +39,9 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 /**
  * 版本自动更新链路:GitHub Releases 检查 → 镜像轮换下载 → 验签 → 安装引导。
  * 从 MainActivity 拆出(v2.6),逻辑与状态机不变;所有方法均假定在主线程调用,
@@ -249,6 +252,7 @@ class Updater {
         new Thread(() -> {
             String version = null;
             String apkUrl = null;
+            String notes = null;
             HttpURLConnection conn = null;
             try {
                 conn = (HttpURLConnection) new URL(RELEASE_API).openConnection();
@@ -257,11 +261,34 @@ class Updater {
                 conn.setReadTimeout(10000);
                 if (conn.getResponseCode() == 200) {
                     String body = readAll(conn.getInputStream());
-                    Matcher tag = TAG_JSON.matcher(body);
-                    Matcher apk = APK_URL_JSON.matcher(body);
-                    if (tag.find() && apk.find()) {
-                        version = tag.group(1);
-                        apkUrl = apk.group(1);
+                    try {
+                        // 用 JSON 解析而不是正则:Release notes(body)里换行/引号都是转义的,
+                        // 正则拿不准;顺带把版本号与 APK 地址一并从结构里取
+                        JSONObject root = new JSONObject(body);
+                        version = normalizeVersion(root.optString("tag_name", ""));
+                        notes = cleanNotes(root.optString("body", ""));
+                        JSONArray assets = root.optJSONArray("assets");
+                        if (assets != null) {
+                            for (int i = 0; i < assets.length(); i++) {
+                                JSONObject a = assets.optJSONObject(i);
+                                if (a == null) {
+                                    continue;
+                                }
+                                String u = a.optString("browser_download_url", "");
+                                if (u.endsWith(".apk")) {
+                                    apkUrl = u;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        // 结构突变时退化到旧正则:只求保住"能检查到更新"这个主功能
+                        Matcher tag = TAG_JSON.matcher(body);
+                        Matcher apk = APK_URL_JSON.matcher(body);
+                        if (tag.find() && apk.find()) {
+                            version = tag.group(1);
+                            apkUrl = apk.group(1);
+                        }
                     }
                 }
             } catch (Exception ignored) {
@@ -272,6 +299,7 @@ class Updater {
             }
             final String v = version;
             final String url = apkUrl;
+            final String noteText = notes;
             activity.runOnUiThread(() -> {
                 checking = false;
                 // 网络请求最长 20s,期间用户可能已退出:销毁后弹对话框会 BadTokenException
@@ -282,7 +310,7 @@ class Updater {
                     // 节流时间戳在"检查真的成功"后才写:失败(如断网)下次启动会重试,而不是被锁 4 小时
                     prefs().edit().putLong(KEY_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply();
                     if (versionNewer(v, appVersion())) {
-                        offerUpdate(v, url);
+                        offerUpdate(v, url, noteText);
                     } else if (manual) {
                         toast("已是最新版本 v" + appVersion());
                     }
@@ -309,6 +337,33 @@ class Updater {
         return false;
     }
 
+    /** tag_name → 纯版本号(去 v/V 前缀,只留数字和点);格式异常返回 null */
+    private String normalizeVersion(String tag) {
+        if (tag == null) {
+            return null;
+        }
+        String t = tag.trim();
+        if (t.startsWith("v") || t.startsWith("V")) {
+            t = t.substring(1);
+        }
+        return t.matches("[0-9][0-9.]*") ? t : null;
+    }
+
+    /** 更新说明展示清理:去掉 markdown 记号(标题 #、加粗 **、反引号),超长截断加提示 */
+    private String cleanNotes(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return null;
+        }
+        String s = raw.replaceAll("(?m)^#{1,6}\\s*", "")
+                .replace("**", "")
+                .replace("`", "")
+                .trim();
+        if (s.length() > 3000) {
+            s = s.substring(0, 3000) + "…\n(完整说明见 GitHub Release 页)";
+        }
+        return s;
+    }
+
     private String readAll(java.io.InputStream in) throws Exception {
         BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
         StringBuilder sb = new StringBuilder();
@@ -320,7 +375,7 @@ class Updater {
         return sb.toString();
     }
 
-    private void offerUpdate(final String version, final String url) {
+    private void offerUpdate(final String version, final String url, final String notes) {
         // 自动检查与手动检查可能先后到达:旧推荐框先关掉,避免叠加
         if (offerDialog != null && offerDialog.isShowing()) {
             try {
@@ -328,9 +383,16 @@ class Updater {
             } catch (Exception ignored) {
             }
         }
+        // "更新说明"直接展示 GitHub Release notes(发版必写,见 AGENTS.md 发版规约):
+        // 每次升级前用户先看到改了什么;长文本 AlertDialog 自带滚动
+        StringBuilder msg = new StringBuilder();
+        if (notes != null && !notes.isEmpty()) {
+            msg.append("更新说明:\n").append(notes).append("\n\n");
+        }
+        msg.append("国内网络将自动优先走加速源下载,失败会自动切换;下载完成后会自动弹出安装界面,首次安装需允许本应用\"安装未知应用\"。");
         offerDialog = new AlertDialog.Builder(activity)
                 .setTitle("发现新版本 v" + version)
-                .setMessage("建议更新以获得最新修复。\n\n国内网络将自动优先走加速源下载,失败会自动切换;下载完成后会自动弹出安装界面,首次安装需允许本应用\"安装未知应用\"。")
+                .setMessage(msg.toString())
                 .setPositiveButton("立即更新", (d, w) -> downloadUpdate(version, url))
                 .setNegativeButton("暂不", null)
                 .show();
