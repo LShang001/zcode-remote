@@ -43,12 +43,26 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "本版�
 
 | 路径 | 为什么必须知道 |
 |------|---------------|
-| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、历史会话、应用锁、会话码、页面缩放等逻辑与 UI 都在这(约 2000 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页。v2.9 起:**destroyWeb 必须连 sessionView 一起从 root 摘除**(自愈重建时旧容器会留在 root 顶层吃掉全部触摸);handleBack 的掀覆盖层分支统一走 showWeb(错误态 reload、无会话直退) |
+| `app/src/main/java/com/zcode/remote/MainActivity.java` | 主源文件:WebView 装载、链接管理、菜单面板、**我的电脑**(多机切换,见下)、应用锁、会话码、页面缩放等逻辑与 UI 都在这(约 2100 行),纯代码布局,不存在 layout XML。页面切换是**覆盖层架构**(v2.4):会话层 sessionView(WebView+进度条+FAB)常驻 root 底层只建一次,设置/错误页是叠在其上的 overlayView,返回会话=removeOverlay 不重载;showWeb 三分支(首次构建/换链 loadUrl/同链秒回),webLoadFailed 标志防错误态秒回露内核白页。v2.9 起:**destroyWeb 必须连 sessionView 一起从 root 摘除**(自愈重建时旧容器会留在 root 顶层吃掉全部触摸);handleBack 的掀覆盖层分支统一走 showWeb(错误态 reload、无会话直退) |
 | `app/src/main/java/com/zcode/remote/Updater.java` | 版本自动更新全链路(v2.6 从 MainActivity 拆出):GitHub Releases 检查、镜像轮换下载、进度轮询、APK 验签、安装引导,状态机与阈值全在此类;MainActivity 只持有 `updater` 实例做委托。v2.10 起更新弹窗直接展示 Release notes 正文(JSON 解析 body 字段,正则仅作结构突变的兜底) |
 | `app/src/main/java/com/zcode/remote/ScanActivity.java` | 扫码绑定页:Camera1 预览 + zxing core 解码,识别远程二维码回传链接给 MainActivity |
 | `gradle.properties` | `android.overridePathCheck=true` 支撑着中文路径构建,删了构建必挂 |
 | `docs/screenshots/` | v1.1 五张视觉基准图;改 UI 后逐张对照,防回归 |
 | `docs/emulator-review.md` | 视觉审查完整流程(预置链接/必查画面清单);改 UI 或发版前读 |
+
+## 核心模型:一台电脑 = 一条记录
+
+**不同会话链接就是不同电脑上的 ZCode**(用户 2026-09-14 明确的心智模型),所以壳里的历史不是"会话流水",
+而是**电脑名册**(菜单入口叫「我的电脑」,v2.11 起):
+
+- 存储:`KEY_HISTORY` 一个 JSON 数组,每条 `{url, name, time}`;`name` 是用户起的显示名,缺省用
+  `deriveName(url)` 从链接参数派生(name > mid > sid 前缀);老记录没有 name 字段,读取时自动补齐
+  (不用做数据迁移)。`MAX_HISTORY` 即最多记几台电脑。
+- 语义:点一条 = 切到那台电脑(同链且会话层在只回覆盖层不重载);长按 = 重命名/删除;
+  `recordHistory` **绝不覆盖已有 name**(用户命名优先);改名后要重开切换器刷新列表(动态快捷方式
+  由 `saveHistory` 里的 `updateDynamicShortcuts` 同步)。
+- 相关文案已统一按"电脑"措辞(菜单头部"当前控制:X"、快捷方式"切换到 X"、设置页说明);
+  新增 UI 文案时沿用这套措辞,不要再出现"历史会话"。
 
 ## 原则
 
