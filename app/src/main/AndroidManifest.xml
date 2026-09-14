@@ -25,12 +25,15 @@
         android:icon="@mipmap/ic_launcher"
         android:label="ZCode Remote"
         android:theme="@style/Theme.App">
+        <!-- configChanges 补齐屏幕形态相关项:折叠屏展开/折叠、分屏调整大小会带来
+             screenLayout/smallestScreenSize(可能还有 density)变化,不声明会重建 Activity——
+             WebView 整页重载、覆盖层与缩放基准全丢(官方折叠屏指南明确要求处理这两项) -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize"
-            android:configChanges="orientation|screenSize|keyboardHidden">
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -57,6 +60,6 @@
             android:name=".ScanActivity"
             android:exported="false"
             android:screenOrientation="portrait"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|uiMode" />
     </application>
 </manifest>

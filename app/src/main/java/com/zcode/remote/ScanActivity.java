@@ -240,6 +240,13 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // 屏幕形态变化(折叠展开/分屏)不重建 Activity:相机继续工作,但预览留边要按新窗口重算
+        fitSurfaceToPreview();
+    }
+
+    @Override
     public void surfaceChanged(SurfaceHolder h, int format, int width, int height) {
         // surface 尺寸就绪后按预览宽高比留边显示,避免全屏拉伸把 QR 模块拉成非正方形
         fitSurfaceToPreview();

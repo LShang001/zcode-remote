@@ -2058,6 +2058,34 @@ public class MainActivity extends Activity {
      * 统一的返回语义:设置页等覆盖层优先(返回=回会话秒回,不退出);错误页覆盖层走退出确认。
      * 返回 true 表示已消费;false 表示应退出 Activity。
      */
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // Manifest 声明了屏幕形态相关变化不重建(折叠/分屏/旋转):自己处理后置兜底——
+        // 屏幕尺寸变了,悬浮钮的旧坐标可能越界,拉回安全边距内
+        clampFabInBounds();
+    }
+
+    /** 把悬浮钮坐标限制在内容区安全边距内(布局未就绪时静默跳过) */
+    private void clampFabInBounds() {
+        if (fab == null || sessionView == null) {
+            return;
+        }
+        sessionView.post(() -> {
+            if (fab == null || sessionView == null || fab.getLayoutParams() == null
+                    || !(fab.getLayoutParams() instanceof FrameLayout.LayoutParams)) {
+                return;
+            }
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) fab.getLayoutParams();
+            int padH = dp(12);
+            lp.leftMargin = clamp(lp.leftMargin, padH,
+                    Math.max(padH, sessionView.getWidth() - fab.getWidth() - padH));
+            lp.topMargin = clamp(lp.topMargin, dp(8),
+                    Math.max(dp(8), sessionView.getHeight() - fab.getHeight() - dp(24)));
+            fab.setLayoutParams(lp);
+        });
+    }
+
     private boolean handleBack() {
         if (overlayView != null && !onErrorPage) {
             // 掀覆盖层统一收敛到 showWeb:同链未失败=秒回;上次加载失败=reload(只掀层会露出
