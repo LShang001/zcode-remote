@@ -392,18 +392,21 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 一台"电脑"=一条记录:url 定位会话,name 是用户起的名字(缺省从链接参数派生),time 用于排序 */
+    /** 一台"电脑"=一条记录:url 定位会话,name 是用户起的名字(缺省从链接参数派生),pinned 置顶,time 用于排序 */
     private static class HistoryItem {
         final String url;
         final String name;
         final long time;
-        HistoryItem(String url, String name, long time) {
+        final boolean pinned;
+        HistoryItem(String url, String name, long time, boolean pinned) {
             this.url = url;
             this.name = name;
             this.time = time;
+            this.pinned = pinned;
         }
     }
 
+    /** 读取电脑列表:置顶的排最前,其余按最近使用排序(列表与桌面快捷方式共用这个顺序) */
     private List<HistoryItem> getHistoryList() {
         List<HistoryItem> list = new ArrayList<>();
         String jsonStr = getPreferences(Context.MODE_PRIVATE).getString(KEY_HISTORY, "[]");
@@ -417,10 +420,16 @@ public class MainActivity extends Activity {
                     // 老记录没有 name 字段:按链接参数派生一个,用户随后可改
                     name = deriveName(url);
                 }
-                list.add(new HistoryItem(url, name, obj.optLong("time")));
+                list.add(new HistoryItem(url, name, obj.optLong("time"), obj.optBoolean("pinned", false)));
             }
         } catch (Exception ignored) {
         }
+        list.sort((a, b) -> {
+            if (a.pinned != b.pinned) {
+                return a.pinned ? -1 : 1;
+            }
+            return Long.compare(b.time, a.time);
+        });
         return list;
     }
 
@@ -432,6 +441,9 @@ public class MainActivity extends Activity {
                 obj.put("url", item.url);
                 obj.put("name", item.name);
                 obj.put("time", item.time);
+                if (item.pinned) {
+                    obj.put("pinned", true);
+                }
                 arr.put(obj);
             } catch (Exception ignored) {
             }
@@ -481,22 +493,24 @@ public class MainActivity extends Activity {
         return deriveName(url);
     }
 
-    /** 记录一次使用:已有记录保留其名字(不覆盖用户命名),新记录自动派生名字 */
+    /** 记录一次使用:已有记录保留其名字与置顶状态(不覆盖用户设置),新记录自动派生名字 */
     private void recordHistory(String url) {
         if (url == null || url.trim().isEmpty()) {
             return;
         }
         List<HistoryItem> updated = new ArrayList<>();
         String name = null;
+        boolean pinned = false;
         for (HistoryItem item : getHistoryList()) {
             if (item.url.equals(url)) {
                 name = item.name;
+                pinned = item.pinned;
             }
         }
         if (name == null || name.trim().isEmpty()) {
             name = deriveName(url);
         }
-        updated.add(new HistoryItem(url, name, System.currentTimeMillis()));
+        updated.add(new HistoryItem(url, name, System.currentTimeMillis(), pinned));
         for (HistoryItem item : getHistoryList()) {
             if (!item.url.equals(url)) {
                 updated.add(item);
@@ -515,13 +529,26 @@ public class MainActivity extends Activity {
         for (HistoryItem item : getHistoryList()) {
             if (item.url.equals(url)) {
                 found = true;
-                updated.add(new HistoryItem(item.url, name, item.time));
+                updated.add(new HistoryItem(item.url, name, item.time, item.pinned));
             } else {
                 updated.add(item);
             }
         }
         if (!found) {
-            updated.add(new HistoryItem(url, name, System.currentTimeMillis()));
+            updated.add(new HistoryItem(url, name, System.currentTimeMillis(), false));
+        }
+        saveHistory(updated);
+    }
+
+    /** 置顶/取消置顶:置顶的排在列表最前,桌面快捷方式也按这个顺序取前两个 */
+    private void setSessionPinned(String url, boolean pinned) {
+        List<HistoryItem> updated = new ArrayList<>();
+        for (HistoryItem item : getHistoryList()) {
+            if (item.url.equals(url)) {
+                updated.add(new HistoryItem(item.url, item.name, item.time, pinned));
+            } else {
+                updated.add(item);
+            }
         }
         saveHistory(updated);
     }
@@ -619,7 +646,7 @@ public class MainActivity extends Activity {
 
             // 电脑名为主标题——切换时认名字比认 URL 快得多
             TextView titleView = new TextView(this);
-            titleView.setText((isCurrent ? "● " : "") + safeName(item));
+            titleView.setText((item.pinned ? "📌 " : "") + (isCurrent ? "● " : "") + safeName(item));
             titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
             titleView.setTextColor(isCurrent ? ACCENT : FG);
             row.addView(titleView);
@@ -650,13 +677,22 @@ public class MainActivity extends Activity {
                 toast("正在切换到 " + safeName(item));
             });
 
-            // 长按:重命名 / 删除(仅影响本机记录,不动电脑那端)
+            // 长按:置顶 / 重命名 / 删除(仅影响本机记录,不动电脑那端)
             row.setOnLongClickListener(v -> {
+                String pinLabel = item.pinned ? "取消置顶" : "置顶（排在列表最前）";
                 new AlertDialog.Builder(this)
                         .setTitle(safeName(item))
-                        .setItems(new String[]{"重命名", "删除这台电脑的记录"},
+                        .setItems(new String[]{pinLabel, "重命名", "删除这台电脑的记录"},
                                 (d, which) -> {
                                     if (which == 0) {
+                                        boolean newPinned = !item.pinned;
+                                        setSessionPinned(item.url, newPinned);
+                                        if (dialogHolder[0] != null) {
+                                            dialogHolder[0].dismiss();
+                                        }
+                                        toast(newPinned ? "已置顶「" + safeName(item) + "」" : "已取消置顶");
+                                        showHistoryDialog();
+                                    } else if (which == 1) {
                                         showRenameDialog(item, dialogHolder);
                                     } else {
                                         confirmRemoveSession(item, dialogHolder);
