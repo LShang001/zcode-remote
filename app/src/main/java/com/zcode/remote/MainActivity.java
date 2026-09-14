@@ -208,7 +208,7 @@ public class MainActivity extends Activity {
         if (cm == null) {
             return;
         }
-        clipListener = new ClipboardManager.OnPrimaryClipChangedListener() {
+        clipListener = new ClipboardManager.OnPrimaryClipChangedListener() {  // 剪贴板里的新链接=另一台电脑
             @Override
             public void onPrimaryClipChanged() {
                 // 前台时剪贴板刚被写入:同步时间戳(只读描述不触发系统提示),内容与已保存不同才采纳
@@ -392,11 +392,14 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 一台"电脑"=一条记录:url 定位会话,name 是用户起的名字(缺省从链接参数派生),time 用于排序 */
     private static class HistoryItem {
         final String url;
+        final String name;
         final long time;
-        HistoryItem(String url, long time) {
+        HistoryItem(String url, String name, long time) {
             this.url = url;
+            this.name = name;
             this.time = time;
         }
     }
@@ -408,21 +411,93 @@ public class MainActivity extends Activity {
             JSONArray arr = new JSONArray(jsonStr);
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject obj = arr.getJSONObject(i);
-                list.add(new HistoryItem(obj.optString("url"), obj.optLong("time")));
+                String url = obj.optString("url");
+                String name = obj.optString("name", "");
+                if (name.trim().isEmpty()) {
+                    // 老记录没有 name 字段:按链接参数派生一个,用户随后可改
+                    name = deriveName(url);
+                }
+                list.add(new HistoryItem(url, name, obj.optLong("time")));
             }
         } catch (Exception ignored) {
         }
         return list;
     }
 
+    private String historyJson(List<HistoryItem> list) {
+        JSONArray arr = new JSONArray();
+        for (HistoryItem item : list) {
+            try {
+                JSONObject obj = new JSONObject();
+                obj.put("url", item.url);
+                obj.put("name", item.name);
+                obj.put("time", item.time);
+                arr.put(obj);
+            } catch (Exception ignored) {
+            }
+        }
+        return arr.toString();
+    }
+
+    private void saveHistory(List<HistoryItem> list) {
+        getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_HISTORY, historyJson(list)).apply();
+        updateDynamicShortcuts();
+    }
+
+    /**
+     * 从远程链接派生一个默认名字:链接里通常带电脑名/机器标识(name/mid 参数),
+     * 没有就退回 sid 前缀——总比一串完整 URL 好认。
+     */
+    private String deriveName(String url) {
+        try {
+            Uri uri = Uri.parse(url);
+            String n = uri.getQueryParameter("name");
+            if (n != null && !n.trim().isEmpty()) {
+                return n.trim();
+            }
+            String mid = uri.getQueryParameter("mid");
+            if (mid != null && !mid.trim().isEmpty()) {
+                return mid.trim();
+            }
+            String sid = uri.getQueryParameter("sid");
+            if (sid != null && !sid.isEmpty()) {
+                return "会话 " + (sid.length() > 6 ? sid.substring(0, 6) : sid);
+            }
+        } catch (Exception ignored) {
+        }
+        return "远程会话";
+    }
+
+    /** 展示用名字:优先用户起的名字(历史里有),否则按链接派生 */
+    private String sessionName(String url) {
+        if (url == null || url.isEmpty()) {
+            return "未设置";
+        }
+        for (HistoryItem item : getHistoryList()) {
+            if (url.equals(item.url) && item.name != null && !item.name.trim().isEmpty()) {
+                return item.name;
+            }
+        }
+        return deriveName(url);
+    }
+
+    /** 记录一次使用:已有记录保留其名字(不覆盖用户命名),新记录自动派生名字 */
     private void recordHistory(String url) {
         if (url == null || url.trim().isEmpty()) {
             return;
         }
-        List<HistoryItem> list = getHistoryList();
         List<HistoryItem> updated = new ArrayList<>();
-        updated.add(new HistoryItem(url, System.currentTimeMillis()));
-        for (HistoryItem item : list) {
+        String name = null;
+        for (HistoryItem item : getHistoryList()) {
+            if (item.url.equals(url)) {
+                name = item.name;
+            }
+        }
+        if (name == null || name.trim().isEmpty()) {
+            name = deriveName(url);
+        }
+        updated.add(new HistoryItem(url, name, System.currentTimeMillis()));
+        for (HistoryItem item : getHistoryList()) {
             if (!item.url.equals(url)) {
                 updated.add(item);
             }
@@ -430,18 +505,25 @@ public class MainActivity extends Activity {
                 break;
             }
         }
-        JSONArray arr = new JSONArray();
-        for (HistoryItem item : updated) {
-            try {
-                JSONObject obj = new JSONObject();
-                obj.put("url", item.url);
-                obj.put("time", item.time);
-                arr.put(obj);
-            } catch (Exception ignored) {
+        saveHistory(updated);
+    }
+
+    /** 重命名一台电脑;若不在历史里(理论上不会)则补一条 */
+    private void setSessionName(String url, String name) {
+        List<HistoryItem> updated = new ArrayList<>();
+        boolean found = false;
+        for (HistoryItem item : getHistoryList()) {
+            if (item.url.equals(url)) {
+                found = true;
+                updated.add(new HistoryItem(item.url, name, item.time));
+            } else {
+                updated.add(item);
             }
         }
-        getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_HISTORY, arr.toString()).apply();
-        updateDynamicShortcuts();
+        if (!found) {
+            updated.add(new HistoryItem(url, name, System.currentTimeMillis()));
+        }
+        saveHistory(updated);
     }
 
     private void clearHistory() {
@@ -449,24 +531,15 @@ public class MainActivity extends Activity {
         updateDynamicShortcuts();
     }
 
-    /** 删除单条历史;若删的是当前会话,不改变当前加载,仅从列表移除 */
+    /** 删除单台电脑的记录;若删的是当前会话,不改变当前加载,仅从列表移除 */
     private void removeHistoryItem(String url) {
-        List<HistoryItem> list = getHistoryList();
-        JSONArray arr = new JSONArray();
-        for (HistoryItem item : list) {
-            if (item.url.equals(url)) {
-                continue;
-            }
-            try {
-                JSONObject obj = new JSONObject();
-                obj.put("url", item.url);
-                obj.put("time", item.time);
-                arr.put(obj);
-            } catch (Exception ignored) {
+        List<HistoryItem> updated = new ArrayList<>();
+        for (HistoryItem item : getHistoryList()) {
+            if (!item.url.equals(url)) {
+                updated.add(item);
             }
         }
-        getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_HISTORY, arr.toString()).apply();
-        updateDynamicShortcuts();
+        saveHistory(updated);
     }
 
     private String formatRelativeTime(long time) {
@@ -482,41 +555,41 @@ public class MainActivity extends Activity {
         }
     }
 
-    private String summarizeUrl(String url) {
+    /** 列表副标题里用的短标识:sid 前 8 位(同一台电脑每次新会话 sid 会变,只用来看个大概) */
+    private String shortUrlId(String url) {
         try {
-            Uri uri = Uri.parse(url);
-            String sid = uri.getQueryParameter("sid");
+            String sid = Uri.parse(url).getQueryParameter("sid");
             if (sid != null && !sid.isEmpty()) {
-                String sub = sid.length() > 8 ? sid.substring(0, 8) + "…" : sid;
-                return "会话 sid: " + sub;
-            }
-            String path = uri.getPath();
-            if (path != null && !path.isEmpty()) {
-                return path;
+                return "sid " + (sid.length() > 8 ? sid.substring(0, 8) + "…" : sid);
             }
         } catch (Exception ignored) {
         }
-        return "远程会话";
+        return url.length() > 34 ? url.substring(0, 34) + "…" : url;
     }
 
+    /**
+     * 电脑切换器:一条记录=一台电脑(一个链接),点一下切换、长按重命名或删除。
+     * 名字优先用户自己起的,其次从链接参数(name/mid)派生;当前正在控制的那台带"当前"标记。
+     */
     private void showHistoryDialog() {
         final List<HistoryItem> list = getHistoryList();
         if (list.isEmpty()) {
             new AlertDialog.Builder(this)
-                    .setTitle("历史会话")
-                    .setMessage("暂无历史会话记录。\n\n当你使用新链接连接后，会自动记录在此处，方便日后切换。")
+                    .setTitle("我的电脑")
+                    .setMessage("还没有记录。\n\n用远程链接连上一台电脑后会自动记在这里,之后一键就能切回来控制它。")
                     .setPositiveButton("知道了", null)
                     .show();
             return;
         }
 
+        final String current = getPreferences(Context.MODE_PRIVATE).getString(KEY_URL, null);
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         int pad = dp(16);
         box.setPadding(pad, pad, pad, pad);
 
         TextView head = new TextView(this);
-        head.setText("最近使用的会话（最多保存 " + MAX_HISTORY + " 条）");
+        head.setText("点一下切换控制哪台电脑,长按可重命名(最多保存 " + MAX_HISTORY + " 台)");
         head.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         head.setTextColor(FG_DIM);
         head.setPadding(0, 0, 0, dp(12));
@@ -525,6 +598,7 @@ public class MainActivity extends Activity {
         final AlertDialog[] dialogHolder = new AlertDialog[1];
 
         for (final HistoryItem item : list) {
+            final boolean isCurrent = item.url.equals(current);
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.VERTICAL);
             row.setPadding(dp(12), dp(10), dp(12), dp(10));
@@ -532,53 +606,62 @@ public class MainActivity extends Activity {
             row.setFocusable(true);
 
             GradientDrawable rowBg = new GradientDrawable();
-            rowBg.setColor(0xFF16181F);
+            rowBg.setColor(isCurrent ? 0xFF1B2A4A : 0xFF16181F);
             rowBg.setCornerRadius(dp(6));
+            if (isCurrent) {
+                rowBg.setStroke(dp(1), ACCENT);
+            }
             row.setBackground(rowBg);
 
             LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             rowLp.bottomMargin = dp(8);
 
+            // 电脑名为主标题——切换时认名字比认 URL 快得多
             TextView titleView = new TextView(this);
-            titleView.setText(summarizeUrl(item.url) + "  ·  " + formatRelativeTime(item.time));
-            titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-            titleView.setTextColor(ACCENT);
+            titleView.setText((isCurrent ? "● " : "") + safeName(item));
+            titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+            titleView.setTextColor(isCurrent ? ACCENT : FG);
             row.addView(titleView);
 
-            TextView urlView = new TextView(this);
-            urlView.setText(item.url);
-            urlView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-            urlView.setTextColor(FG_DIM);
-            urlView.setSingleLine(true);
-            urlView.setPadding(0, dp(4), 0, 0);
-            row.addView(urlView);
+            TextView metaView = new TextView(this);
+            metaView.setText(shortUrlId(item.url) + "  ·  " + formatRelativeTime(item.time)
+                    + (isCurrent ? "  ·  当前" : ""));
+            metaView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            metaView.setTextColor(FG_DIM);
+            metaView.setSingleLine(true);
+            metaView.setPadding(0, dp(4), 0, 0);
+            row.addView(metaView);
 
             row.setOnClickListener(v -> {
                 if (dialogHolder[0] != null) {
                     dialogHolder[0].dismiss();
                 }
                 dismissMenu();
+                if (isCurrent && sessionView != null) {
+                    // 已经是当前电脑:只回会话层,不重载(会话秒回)
+                    showWeb(item.url);
+                    toast("已在控制 " + safeName(item));
+                    return;
+                }
                 getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_URL, item.url).apply();
                 recordHistory(item.url);
                 showWeb(item.url);
-                toast("已切换到选中的历史会话");
+                toast("正在切换到 " + safeName(item));
             });
 
-            // 长按单条:仅删除这条历史(不影响当前会话),避免只能一键清空
+            // 长按:重命名 / 删除(仅影响本机记录,不动电脑那端)
             row.setOnLongClickListener(v -> {
                 new AlertDialog.Builder(this)
-                        .setTitle("删除这条历史会话")
-                        .setMessage(summarizeUrl(item.url) + "\n\n仅从历史列表移除,不会影响当前打开的会话。")
-                        .setPositiveButton("删除", (d, w) -> {
-                            removeHistoryItem(item.url);
-                            if (dialogHolder[0] != null) {
-                                dialogHolder[0].dismiss();
-                            }
-                            toast("已删除该条历史");
-                            showHistoryDialog();
-                        })
-                        .setNegativeButton("取消", null)
+                        .setTitle(safeName(item))
+                        .setItems(new String[]{"重命名", "删除这台电脑的记录"},
+                                (d, which) -> {
+                                    if (which == 0) {
+                                        showRenameDialog(item, dialogHolder);
+                                    } else {
+                                        confirmRemoveSession(item, dialogHolder);
+                                    }
+                                })
                         .show();
                 return true;
             });
@@ -590,13 +673,77 @@ public class MainActivity extends Activity {
         sc.addView(box);
 
         dialogHolder[0] = new AlertDialog.Builder(this)
-                .setTitle("历史会话")
+                .setTitle("我的电脑")
                 .setView(sc)
-                .setPositiveButton("清空历史", (d, w) -> {
-                    clearHistory();
-                    toast("历史记录已清空");
+                .setPositiveButton("关闭", null)
+                .setNeutralButton("清空列表", (d, w) -> new AlertDialog.Builder(this)
+                        .setTitle("清空列表")
+                        .setMessage("只会清掉本机的记录,不会影响任何电脑上的会话。确定吗?")
+                        .setPositiveButton("清空", (d2, w2) -> {
+                            clearHistory();
+                            toast("列表已清空");
+                        })
+                        .setNegativeButton("取消", null)
+                        .show())
+                .show();
+    }
+
+    private String safeName(HistoryItem item) {
+        return item.name == null || item.name.trim().isEmpty() ? deriveName(item.url) : item.name;
+    }
+
+    /** 重命名一台电脑:改名只影响列表显示,不影响链接本身 */
+    private void showRenameDialog(final HistoryItem item, final AlertDialog[] holder) {
+        final EditText input = new EditText(this);
+        input.setText(safeName(item));
+        input.setSingleLine(true);
+        input.setSelectAllOnFocus(true);
+        input.setTextColor(FG);
+        input.setBackgroundTintList(ColorStateList.valueOf(ACCENT));
+        int pad = dp(20);
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(pad, dp(8), pad, 0);
+        wrap.addView(input, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this)
+                .setTitle("给这台电脑起个名字")
+                .setView(wrap)
+                .setMessage("例如:办公台式机、家里笔记本。改名只影响本机列表显示。")
+                .setPositiveButton("保存", (d, w) -> {
+                    String name = input.getText().toString().trim();
+                    if (name.isEmpty()) {
+                        toast("名字不能为空");
+                        return;
+                    }
+                    if (name.length() > 24) {
+                        name = name.substring(0, 24);
+                    }
+                    setSessionName(item.url, name);
+                    toast("已重命名为「" + name + "」");
+                    // 列表标题/动态快捷方式都要跟着新名字刷新:重开切换器
+                    if (holder[0] != null) {
+                        holder[0].dismiss();
+                    }
+                    showHistoryDialog();
                 })
-                .setNegativeButton("关闭", null)
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void confirmRemoveSession(final HistoryItem item, final AlertDialog[] holder) {
+        new AlertDialog.Builder(this)
+                .setTitle("删除「" + safeName(item) + "」")
+                .setMessage("只从本机列表移除这台电脑的记录,不会影响电脑上正在进行的会话。")
+                .setPositiveButton("删除", (d, w) -> {
+                    removeHistoryItem(item.url);
+                    if (holder[0] != null) {
+                        holder[0].dismiss();
+                    }
+                    toast("已删除「" + safeName(item) + "」");
+                    showHistoryDialog();
+                })
+                .setNegativeButton("取消", null)
                 .show();
     }
 
@@ -609,7 +756,7 @@ public class MainActivity extends Activity {
             lastAdoptedClip = clip;
             prefs.edit().putString(KEY_URL, clip).apply();
             recordHistory(clip);
-            Toast.makeText(this, "已识别剪贴板中的新会话链接", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "已识别新电脑链接:「" + deriveName(clip) + "」", Toast.LENGTH_SHORT).show();
             showWeb(clip);
             return true;
         }
@@ -1048,7 +1195,10 @@ public class MainActivity extends Activity {
         box.addView(title);
 
         TextView session = new TextView(this);
-        session.setText("当前会话:" + (url.isEmpty() ? "(未设置)" : url));
+        // 头部显示当前正在控制的电脑名(长按「我的电脑」或从列表可改名),URL 不再占据视线
+        String curName = sessionName(url);
+        session.setText("当前控制:" + curName
+                + (url.isEmpty() ? "" : "  ·  " + shortUrlId(url)));
         session.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         session.setTextColor(FG_DIM);
         session.setPadding(0, 0, 0, dp(8));
@@ -1086,7 +1236,7 @@ public class MainActivity extends Activity {
                 toast("无法拉起系统分享");
             }
         }));
-        box.addView(panelRow("🕒", "历史会话", "查看或切换最近使用过的会话", v -> showHistoryDialog()));
+        box.addView(panelRow("🖥", "我的电脑", "一键切换到其他电脑(可重命名)", v -> showHistoryDialog()));
         box.addView(panelRow("▣", "出示会话码", "把当前链接生成二维码,供其他设备扫码接管", v -> showSessionQr(url)));
         box.addView(panelRow("⬇", "检查更新", "查看 GitHub 上是否有新版本", v -> updater.checkUpdate(true)));
 
@@ -1444,7 +1594,7 @@ public class MainActivity extends Activity {
         box.addView(title);
 
         TextView hint = new TextView(this);
-        hint.setText("把电脑上 ZCode 生成的远程链接(以 https://zcode.z.ai/remote 开头)粘贴到下面保存。\n\n之后开启新会话有三种方式进入:\n· 在手机上复制新链接,打开本 App 自动识别\n· 在微信/QQ 里直接点开链接,选择用本 App 打开\n· 长按桌面图标 →「更换链接」回到本页");
+        hint.setText("把电脑上 ZCode 生成的远程链接(以 https://zcode.z.ai/remote 开头)粘贴到下面保存。\n\n每台电脑保存一条链接,之后从菜单「我的电脑」一键切换、可重命名。\n\n新会话链接的三种进入方式:\n· 在手机上复制新链接,打开本 App 自动识别\n· 在微信/QQ 里直接点开链接,选择用本 App 打开\n· 长按桌面图标 →「更换链接」回到本页");
         hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         hint.setTextColor(FG_DIM);
         hint.setPadding(0, dp(12), 0, dp(8));
@@ -1517,7 +1667,7 @@ public class MainActivity extends Activity {
         scan.setOnClickListener(v -> startScan());
 
         Button hist = new Button(this);
-        hist.setText("历史会话");
+        hist.setText("我的电脑");
         styleSecondary(hist);
         box.addView(hist, buttonLp());
         hist.setOnClickListener(v -> showHistoryDialog());
@@ -1547,11 +1697,22 @@ public class MainActivity extends Activity {
         showOverlay(scrollWrap(box));
     }
 
-    /** 设置页确认后的统一保存入口:存偏好、记历史、打开 */
+    /** 设置页确认后的统一保存入口:存偏好、记历史、打开;首次接入的电脑顺带提示可命名 */
     private void saveAndOpen(String url) {
+        boolean isNew = true;
+        for (HistoryItem item : getHistoryList()) {
+            if (item.url.equals(url)) {
+                isNew = false;
+                break;
+            }
+        }
         getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_URL, url).apply();
         recordHistory(url);
         showWeb(url);
+        if (isNew) {
+            // 新电脑已自动按链接参数起了名字,提醒一句让用户知道能改
+            toast("已记录「" + deriveName(url) + "」,长按「我的电脑」里它可重命名");
+        }
     }
 
     /** 设置/错误页容器:竖屏占满,横屏与平板限宽居中,内容超高可滚动 */
@@ -1795,8 +1956,8 @@ public class MainActivity extends Activity {
             for (int i = 0; i < history.size() && i < 2; i++) {
                 HistoryItem item = history.get(i);
                 list.add(new ShortcutInfo.Builder(this, "session_" + i)
-                        .setShortLabel(summarizeUrl(item.url))
-                        .setLongLabel("打开会话 " + summarizeUrl(item.url))
+                        .setShortLabel(safeName(item))
+                        .setLongLabel("切换到 " + safeName(item))
                         .setIcon(Icon.createWithResource(this, R.drawable.ic_launcher_foreground))
                         .setIntent(new Intent(this, MainActivity.class)
                                 .setAction(ACTION_OPEN_SESSION)
