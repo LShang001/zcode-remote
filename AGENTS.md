@@ -49,6 +49,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "本版�
 | `gradle.properties` | `android.overridePathCheck=true` 支撑着中文路径构建,删了构建必挂 |
 | `docs/screenshots/` | v1.1 五张视觉基准图;改 UI 后逐张对照,防回归 |
 | `docs/emulator-review.md` | 视觉审查完整流程(预置链接/必查画面清单);改 UI 或发版前读 |
+| `docs/multi-session-feasibility.md` | **多会话/多窗口可行性分析**(2026-09-14):折叠屏并排控制多台电脑的路线比较(A 多 task / B App 内多窗格)、平台事实与官方依据、必须先验证的 6 个不确定点、建议落地顺序。动手做多窗口前先读这篇 |
 
 ## 核心模型:一台电脑 = 一条记录
 
@@ -139,6 +140,9 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "本版�
 - **更新流状态要持久化 + 启动对账**:下载中 App 被划掉/进程死亡后 DownloadManager 仍在后台下载,广播是动态注册非粘性,完成事件永久丢失——把 pendingDownloadId/version/url 存 SharedPreferences,onCreate 对账:下载中→续轮询、已完成→问用户是否续装、条目消失→清状态(来源:2026-09-14 v2.9)
 - **`intent://` 外链在 startActivity 前必须 `setComponent(null)` + `setSelector(null)`**:网页可借 `Intent;component=...` 拉起任意 exported 组件携带可控 extras(Chrome 早已修的经典 intent:// 滥用模式)(来源:2026-09-14 v2.9 代码审计)
 - **WebView 的 onPermissionRequest 不要静默授权摄像头**:WebView 默认就是 deny,壳里只要 App 自身持有 CAMERA 就 grant 会让远程页(或其第三方脚本)无感开摄像头——改为每次弹确认框;Manifest 没声明的权限(如 RECORD_AUDIO)检查必然为 denied,对应分支是死代码要删(来源:2026-09-14 v2.9 代码审计)
+- **折叠屏/分屏必须声明 `smallestScreenSize|screenLayout`(以及 `density`/`uiMode`)到 configChanges**:展开/折叠、进出分屏带来这些配置变化,未声明 → Activity 重建 → WebView 整页重载、覆盖层与缩放基准全丢(官方折叠屏指南明确要求处理这两项);v2.13 已补齐,并加 onConfigurationChanged 兜底把 FAB 拉回安全区(来源:2026-09-14 v2.13,官方 learn-about-foldables 实证)
+- **同一进程的多个 WebView 默认共享 Cookie 与 DOM storage**——远程页的 relay 登录态就在 DOM storage,"两个 WebView 各连一台电脑"会互踩。正解是 androidx.webkit 1.9+ 的 Multi-Profile API(`WebViewCompat.setProfile`,需运行时 `WebViewFeature.isFeatureSupported(MULTI_PROFILE)` 检查;setProfile 必须在 WebView 挂到视图树后、任何其它操作前调用)。另:`onRenderProcessGone` 对一次崩溃会**逐个**回调受影响的 WebView,多实例自愈不能假设只有一个(来源:2026-09-14 多窗口可行性调研,官方 WebViewClient/WebViewCompat 文档)
+- **同 App 多实例的前提是 `launchMode="standard"`**:`documentLaunchMode` 的 never/none 之外的取值要求 Activity 不是 singleTask(当前壳是 singleTask,做多窗口必须先改,并重新定义深链/剪贴板等单会话语义);`resizeableActivity` 在 targetSdk≥24 未声明时默认 true,不用改(来源:同上,官方 activity-element)
 
 ## 知识沉淀协议
 
