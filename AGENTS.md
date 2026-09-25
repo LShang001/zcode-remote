@@ -59,9 +59,9 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "本版�
 - 存储:`KEY_HISTORY` 一个 JSON 数组,每条 `{url, name, time}`;`name` 是用户起的显示名,缺省用
   `deriveName(url)` 从链接参数派生(name > mid > sid 前缀);老记录没有 name 字段,读取时自动补齐
   (不用做数据迁移)。`MAX_HISTORY` 即最多记几台电脑。
-- 语义:点一条 = 切到那台电脑(同链且会话层在只回覆盖层不重载);长按 = 重命名/删除;
+- 语义:点一条 = 切到那台电脑(同链且会话层在只回覆盖层不重载);右侧「操作」或长按 = 置顶/重命名/删除;
   `recordHistory` **绝不覆盖已有 name**(用户命名优先);改名后要重开切换器刷新列表(动态快捷方式
-  由 `saveHistory` 里的 `updateDynamicShortcuts` 同步)。
+  由 `saveHistory` 里的 `updateDynamicShortcuts` 同步)。快捷方式 Intent 只传本机记录哈希标识,不得再放含 sid 的完整 URL。
 - 相关文案已统一按"电脑"措辞(菜单头部"当前控制:X"、快捷方式"切换到 X"、设置页说明);
   新增 UI 文案时沿用这套措辞,不要再出现"历史会话"。
 
@@ -118,7 +118,7 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "本版�
 - 渲染崩溃自愈的模拟器验证法:`adb shell ps -A | grep sandboxed` 找 `com.google.android.webview:sandboxed_process0` 的 pid,`kill -9` 即触发 `onRenderProcessGone`;自愈成功=App 主进程存活且会话层重建重载(来源:2026-09-07 v2.6 模拟器实测)
 - 模拟器 SystemUI 对**连续两条 Toast 有竞态**:前一条未退场时后一条报 "Adding more than one toast window for UID at a time" 被静默丢弃——验证"即时反馈+结果反馈"双 Toast 链路时截图看不到第二条不代表代码没跑,以 logcat(`ToastPresenter`/`CoreBackPreview Window Toast`)为准(来源:2026-09-07 v2.6 实测)
 - 动态快捷方式(`ShortcutManager.setDynamicShortcuts`)只在 recordHistory 调用链里刷新的话,**从持久化 prefs 恢复的历史不会同步**(启动路径不经过 recordHistory)——onCreate 需补一次同步;注册情况用 `adb shell dumpsys shortcut` 查(来源:2026-09-07 v2.6 模拟器实测)
-- 模拟器默认未录指纹/人脸,`BiometricManager.canAuthenticate()` 返回 NONE_ENROLLED:应用锁在模拟器只能验"无法验证→跳过"降级分支,真认证弹窗要真机验;框架 `android.hardware.biometrics.BiometricPrompt` 为 API 28+,minSdk 26 的两档老系统直接放行不锁死(来源:2026-09-07 v2.6)
+- 模拟器默认未录指纹/人脸,`BiometricManager.canAuthenticate()` 返回 NONE_ENROLLED:可临时设置模拟器 PIN 验证设备屏幕锁回退。v2.14 应用锁无「跳过」且冷启动先遮挡、认证后才建 WebView;API 26/27 也走设备屏幕锁,没有可用的设备解锁方式时不允许新开启应用锁。模拟器测完 PIN 记得清除(来源:2026-09-07 v2.6、2026-09-25 v2.14)
 - **Android 14+/targetSdk 34 读 `DownloadManager.COLUMN_LOCAL_FILENAME` 直接抛 SecurityException**(系统提示改用 ContentResolver.openFileDescriptor);吞掉该异常会得到 path=null,更新链路把"下载已完成"误判成"源失败"→换源重下循环→最终报下载失败,而文件其实躺在下载目录(v2.6 真机反馈的原样症状)——验签必须先经 `getUriForDownloadedFile`+`openInputStream` 拷进私有缓存再解析;**完成态(SUCCESSFUL)只允许阻断提示,绝不允许换源重下**;验签各步判定看 logcat TAG=`ZCodeUpdater`(来源:2026-09-07 v2.7 模拟器端到端实测,日志实锤 SecurityException)
 - **WebView 双指捏合缩放要三件套一起开**:`setSupportZoom(true)` + `setBuiltInZoomControls(true)` + `setDisplayZoomControls(false)`。**`setBuiltInZoomControls` 默认 false**——只开 support 不开 builtin,捏合完全无效且无任何报错(壳从 v1.0 到 v2.7 一直是这个状态,来源:2026-09-08 v2.8)
 - **页面缩放别用 `setInitialScale`**:官方文档写明它只对"没有 viewport meta 的页面"生效,而远程页自带 `<meta name="viewport" content="width=device-width, initial-scale=1">`——改用加载完成后按倍数 `WebView.zoomBy()`(来源:2026-09-08 v2.8,AOSP WebView.java javadoc 实查)
@@ -143,6 +143,9 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "本版�
 - **折叠屏/分屏必须声明 `smallestScreenSize|screenLayout`(以及 `density`/`uiMode`)到 configChanges**:展开/折叠、进出分屏带来这些配置变化,未声明 → Activity 重建 → WebView 整页重载、覆盖层与缩放基准全丢(官方折叠屏指南明确要求处理这两项);v2.13 已补齐,并加 onConfigurationChanged 兜底把 FAB 拉回安全区(来源:2026-09-14 v2.13,官方 learn-about-foldables 实证)
 - **同一进程的多个 WebView 默认共享 Cookie 与 DOM storage**——远程页的 relay 登录态就在 DOM storage,"两个 WebView 各连一台电脑"会互踩。正解是 androidx.webkit 1.9+ 的 Multi-Profile API(`WebViewCompat.setProfile`,需运行时 `WebViewFeature.isFeatureSupported(MULTI_PROFILE)` 检查;setProfile 必须在 WebView 挂到视图树后、任何其它操作前调用)。另:`onRenderProcessGone` 对一次崩溃会**逐个**回调受影响的 WebView,多实例自愈不能假设只有一个(来源:2026-09-14 多窗口可行性调研,官方 WebViewClient/WebViewCompat 文档)
 - **同 App 多实例的前提是 `launchMode="standard"`**:`documentLaunchMode` 的 never/none 之外的取值要求 Activity 不是 singleTask(当前壳是 singleTask,做多窗口必须先改,并重新定义深链/剪贴板等单会话语义);`resizeableActivity` 在 targetSdk≥24 未声明时默认 true,不用改(来源:同上,官方 activity-element)
+- **DownloadManager 的 ACTION_DOWNLOAD_COMPLETE 广播包含 FAILED 条目**:收到匹配 id 不能直接 `scheduleVerify`,应先查询 `COLUMN_STATUS`:成功→延迟验签,失败→换源;否则失败下载抢在轮询前把 id 清零、跳过镜像兜底。重启恢复下载应连源下标/轮次一起恢复,避免失败后重走第一源(来源:2026-09-25 v2.14 代码审计)
+- **扫码相机与相册异步解码竞争时必须使旧结果失效**:开启系统选图前停预览并递增代数;相机结果回主线程时核对代数与 `galleryActive`,避免选择器打开后旧相机帧把用户选择抢走。Otsu 灰度累加/类间方差不可用 int,常规大图就会溢出(来源:2026-09-25 v2.14 代码审计)
+- **应用锁检查不能晚于会话路由**:即便 BiometricPrompt 延迟弹出只有 300ms,WebView 在提示前已加载,取消按钮若允许「跳过」则已存 sid 直接可用;冷启动先遮挡且暂缓 route/恢复更新,成功认证后再加载(来源:2026-09-25 v2.14 代码审计和模拟器验证)
 
 ## 知识沉淀协议
 

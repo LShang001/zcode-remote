@@ -70,6 +70,9 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     private MultiFormatReader reader;
     private boolean hasSurface;
     private boolean decoded;
+    private boolean galleryActive;
+    private boolean resumed;
+    private int previewGeneration;
     private long lastDecode;
     private int previewW;
     private int previewH;
@@ -84,6 +87,7 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     // 取景框引用,用于识别状态变色;状态防止"非远程二维码"Toast 每帧刷屏
     private View frameBox;
     private GradientDrawable frameDrawable;
+    private TextView scanStatus;
     private boolean showingMismatch = false;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private static final int ACCENT_GREEN = 0xFF34C759;
@@ -139,7 +143,7 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.VERTICAL);
         top.setPadding(dp(20), dp(28), dp(20), dp(12));
-        top.setBackgroundColor(0x66000000);
+        top.setBackgroundColor(0xDD000000);
         TextView title = new TextView(this);
         title.setText("扫码绑定");
         title.setTextColor(FG);
@@ -160,12 +164,20 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         bottom.setOrientation(LinearLayout.VERTICAL);
         bottom.setGravity(Gravity.CENTER_HORIZONTAL);
         bottom.setPadding(dp(20), dp(16), dp(20), dp(28));
-        bottom.setBackgroundColor(0x66000000);
+        bottom.setBackgroundColor(0xDD000000);
         TextView hint = new TextView(this);
         hint.setText("识别成功后会自动打开会话");
         hint.setTextColor(FG_DIM);
         hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         bottom.addView(hint);
+        scanStatus = new TextView(this);
+        scanStatus.setText("正在扫描二维码");
+        scanStatus.setTextColor(FG);
+        scanStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        scanStatus.setGravity(Gravity.CENTER);
+        scanStatus.setPadding(0, dp(8), 0, 0);
+        scanStatus.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        bottom.addView(scanStatus);
 
         LinearLayout btns = new LinearLayout(this);
         btns.setOrientation(LinearLayout.HORIZONTAL);
@@ -255,9 +267,10 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
         // onPause 释放了相机,但分屏/小窗/相册返回等场景 surface 不会重建(surfaceCreated 不再回调),
         // 没有这里会出现"预览定格/黑屏且永远扫不出",只能退出重进
-        if (!decoded && hasSurface) {
+        if (!decoded && !galleryActive && hasSurface) {
             initCamera();
         }
     }
@@ -276,7 +289,7 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
                 != PackageManager.PERMISSION_GRANTED) {
             return;
         }
-        if (!hasSurface) {
+        if (!hasSurface || !resumed || galleryActive) {
             return;
         }
         try {
@@ -417,7 +430,7 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void onPreviewFrame(byte[] data, Camera c) {
-        if (decoded || decoding || decodeHandler == null) {
+        if (decoded || decoding || galleryActive || !resumed || decodeHandler == null) {
             return;
         }
         long now = System.currentTimeMillis();
@@ -452,6 +465,7 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         }
         final int rw = cropW;
         final int rh = cropH;
+        final int generation = previewGeneration;
         decoding = true;
         decodeHandler.post(() -> {
             String found = null;
@@ -472,8 +486,11 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
             }
             final String text = found;
             mainHandler.post(() -> {
+                if (generation != previewGeneration || galleryActive) {
+                    return;
+                }
                 decoding = false;
-                if (isFinishing() || isDestroyed()) {
+                if (isFinishing() || isDestroyed() || !resumed) {
                     return;
                 }
                 handleDecodedText(text);
@@ -526,6 +543,9 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
             if (frameDrawable != null) {
                 frameDrawable.setStroke(dp(3), mismatch ? ACCENT_RED : ACCENT);
             }
+            if (scanStatus != null) {
+                scanStatus.setText(mismatch ? "识别到二维码,但不是 ZCode 远程链接" : "正在扫描二维码");
+            }
             if (mismatch) {
                 Toast.makeText(this, "识别到二维码,但不是有效的 ZCode 远程链接", Toast.LENGTH_SHORT).show();
             }
@@ -538,6 +558,9 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
         mainHandler.post(() -> {
             if (frameDrawable != null) {
                 frameDrawable.setStroke(dp(3), ACCENT_GREEN);
+            }
+            if (scanStatus != null) {
+                scanStatus.setText("识别成功,正在打开电脑会话");
             }
         });
         Intent out = new Intent();
@@ -567,12 +590,24 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
 
     /** 相册选图:无需存储权限,用系统图片选择器返回 content uri 后解码 */
     private void openGallery() {
+        galleryActive = true;
+        previewGeneration++;
+        decoding = false;
+        if (scanStatus != null) {
+            scanStatus.setText("请从相册选择二维码图片");
+        }
+        releaseCamera();
         try {
             Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
             intent.setType("image/*");
             startActivityForResult(intent, REQ_GALLERY);
         } catch (Exception e) {
+            galleryActive = false;
+            if (scanStatus != null) {
+                scanStatus.setText("无法打开相册,请用相机扫码");
+            }
+            initCamera();
             Toast.makeText(this, "无法打开相册", Toast.LENGTH_SHORT).show();
         }
     }
@@ -580,28 +615,53 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQ_GALLERY && resultCode == RESULT_OK && data != null && data.getData() != null) {
+        if (requestCode != REQ_GALLERY) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            galleryActive = false;
+            decoding = false;
+            if (scanStatus != null) {
+                scanStatus.setText("已取消选图,正在扫描二维码");
+            }
+            if (resumed) {
+                initCamera();
+            }
+            return;
+        }
+        if (requestCode == REQ_GALLERY) {
             // 大图解码(全尺寸 JPEG 采样解码 + 放大 + 二值化)可能到秒级,必须放工作线程,
             // 否则主线程冻结,用户以为死机
             final Uri uri = data.getData();
             galleryOom = false;
             if (decodeHandler == null) {
+                galleryActive = false;
                 return;
+            }
+            if (scanStatus != null) {
+                scanStatus.setText("正在识别相册图片…");
             }
             decoding = true;
             decodeHandler.post(() -> {
                 final String url = decodeGalleryImage(uri);
                 mainHandler.post(() -> {
                     decoding = false;
+                    galleryActive = false;
                     if (isFinishing() || isDestroyed()) {
                         return;
                     }
                     if (url != null) {
                         returnWithUrl(url);
                     } else {
-                        Toast.makeText(this, galleryOom
-                                ? "图片太大,无法处理,请换一张较小的截图"
-                                : "这张图里没识别到有效的 ZCode 远程二维码", Toast.LENGTH_LONG).show();
+                        String message = galleryOom ? "图片太大,请换较小的截图"
+                                : "图片里没有有效的 ZCode 远程二维码,可重新选图";
+                        if (scanStatus != null) {
+                            scanStatus.setText(message);
+                        }
+                        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+                        if (resumed) {
+                            initCamera();
+                        }
                     }
                 });
             });
@@ -729,11 +789,13 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
             hist[luminance(p)]++;
         }
         int total = pixels.length;
-        int sum = 0;
+        long sum = 0;
         for (int i = 0; i < 256; i++) {
-            sum += i * hist[i];
+            sum += (long) i * hist[i];
         }
-        int sumB = 0, wB = 0, maxVar = 0, threshold = 128;
+        long sumB = 0;
+        int wB = 0, threshold = 128;
+        double maxVar = -1;
         for (int t = 0; t < 256; t++) {
             wB += hist[t];
             if (wB == 0) {
@@ -744,9 +806,9 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
                 break;
             }
             sumB += t * hist[t];
-            int mB = sumB / wB;
-            int mF = (sum - sumB) / wF;
-            int d = wB * wF * (mB - mF) * (mB - mF);
+            double mB = (double) sumB / wB;
+            double mF = (double) (sum - sumB) / wF;
+            double d = (double) wB * wF * (mB - mF) * (mB - mF);
             if (d > maxVar) {
                 maxVar = d;
                 threshold = t;
@@ -779,6 +841,11 @@ public class ScanActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onPause() {
         super.onPause();
+        resumed = false;
+        previewGeneration++;
+        if (!galleryActive) {
+            decoding = false;
+        }
         releaseCamera();
     }
 

@@ -3,6 +3,7 @@ package com.zcode.remote;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.app.KeyguardManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -22,6 +23,7 @@ import android.os.CancellationSignal;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -51,6 +53,8 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.json.JSONArray;
@@ -84,6 +88,7 @@ public class MainActivity extends Activity {
     private static final String ACTION_CHANGE_URL = "com.zcode.remote.CHANGE_URL";
     private static final String ACTION_SCAN_BIND = "com.zcode.remote.SCAN_BIND";
     private static final String ACTION_OPEN_SESSION = "com.zcode.remote.OPEN_SESSION";
+    private static final String KEY_SHORTCUT_ID = "computer_id";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk(逻辑在 Updater)
     static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
@@ -99,6 +104,7 @@ public class MainActivity extends Activity {
     private static final int REQ_FILE = 1;
     private static final int REQ_SCAN = 2;
     private static final int REQ_NOTIF = 3;
+    private static final int REQ_DEVICE_UNLOCK = 4;
     // 页面缩放:zoomFactor 是"相对页面自然缩放的倍数"(1.0=原始大小),范围与步进
     private static final float ZOOM_MIN = 0.5f;
     private static final float ZOOM_MAX = 3.0f;
@@ -143,6 +149,11 @@ public class MainActivity extends Activity {
     private boolean unlockedThisSession = false;
     private boolean lockArmed = false;
     private CancellationSignal lockCancel;
+    private boolean deviceUnlockPending = false;
+    private boolean lockRetryRequired = false;
+    private View lockCover;
+    private Intent deferredIntent;
+    private boolean initialRouteDone = false;
     // 延迟弹出的验证任务:onDestroy 要移除,避免销毁后仍弹 BiometricPrompt(窗口泄漏/崩溃)
     private final Runnable lockRunnable = this::showLock;
     private AlertDialog qrDialog;
@@ -163,18 +174,49 @@ public class MainActivity extends Activity {
         root = new FrameLayout(this);
         root.setBackgroundColor(BG);
         setContentView(root);
-        // 历史可能来自上次会话的持久化(本次启动不一定会走 recordHistory),启动即同步一次快捷方式
+        if (Build.VERSION.SDK_INT >= 33) {
+            setRecentsScreenshotEnabled(false);
+        }
+        if (isAppLocked()) {
+            deferredIntent = getIntent();
+            showLockCover();
+        } else {
+            finishStartup(getIntent());
+        }
+    }
+
+    private void finishStartup(Intent intent) {
+        if (initialRouteDone || isFinishing() || isDestroyed()) {
+            return;
+        }
+        initialRouteDone = true;
+        // 历史可能来自上次会话的持久化,解锁后同步桌面快捷方式
         updateDynamicShortcuts();
-        route(getIntent());
-        // 上次进程死亡时挂起的更新下载:先对账续上(续轮询/续验签安装),避免更新流静默丢失
+        if (isExplicitRoute(intent)) {
+            lastClipTimestamp = clipboardTimestamp();
+        }
+        route(intent);
+        // 进程死亡时挂起的更新下载:解锁后对账,避免锁屏上显示安装弹窗
         boolean resumedUpdate = updater.reconcilePending();
         SharedPreferences sp = getPreferences(Context.MODE_PRIVATE);
-        // 自动检查节流:距上次检查不足 4 小时则跳过,避免每次冷启动都打 GitHub API
         if (!resumedUpdate && sp.getBoolean(Updater.KEY_AUTO_UPDATE, true)
                 && System.currentTimeMillis() - sp.getLong(Updater.KEY_LAST_UPDATE_CHECK, 0L)
                 >= Updater.UPDATE_CHECK_INTERVAL_MS) {
             updater.checkUpdate(false);
         }
+    }
+
+    private boolean isAppLocked() {
+        return !unlockedThisSession
+                && getPreferences(Context.MODE_PRIVATE).getBoolean(KEY_APP_LOCK, false);
+    }
+
+    private boolean isExplicitRoute(Intent intent) {
+        return intent != null && (ACTION_CHANGE_URL.equals(intent.getAction())
+                || ACTION_SCAN_BIND.equals(intent.getAction())
+                || ACTION_OPEN_SESSION.equals(intent.getAction())
+                || Intent.ACTION_VIEW.equals(intent.getAction())
+                || Intent.ACTION_SEND.equals(intent.getAction()));
     }
 
     /**
@@ -212,7 +254,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPrimaryClipChanged() {
                 // 前台时剪贴板刚被写入:同步时间戳(只读描述不触发系统提示),内容与已保存不同才采纳
-                if (inForeground) {
+                if (inForeground && !isAppLocked()) {
                     lastClipTimestamp = clipboardTimestamp();
                     switchToClipboardUrl();
                 }
@@ -274,6 +316,15 @@ public class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        setIntent(intent);
+        if (isAppLocked()) {
+            deferredIntent = intent;
+            showLockCover();
+            return;
+        }
+        if (isExplicitRoute(intent)) {
+            lastClipTimestamp = clipboardTimestamp();
+        }
         route(intent);
     }
 
@@ -284,12 +335,14 @@ public class MainActivity extends Activity {
         // 回前台时若剪贴板时间戳变了才读一次(复制发生在其他 App 时 listener 收不到变化,
         // 必须回前台补检;时间戳没变说明同一份内容已处理过,跳过以避免反复触发系统"已粘贴自"提示)
         long ts = clipboardTimestamp();
-        if (ts != lastClipTimestamp) {
-            lastClipTimestamp = ts;
-            switchToClipboardUrl();
+        if (!isAppLocked()) {
+            if (ts != lastClipTimestamp) {
+                lastClipTimestamp = ts;
+                switchToClipboardUrl();
+            }
+            // 从"安装未知应用"授权设置回来:已有验签通过的包就直接续装
+            updater.maybeResumeInstallAfterPermission();
         }
-        // 从"安装未知应用"授权设置回来:已有验签通过的包就直接续装
-        updater.maybeResumeInstallAfterPermission();
         maybeArmAppLock();
     }
 
@@ -297,6 +350,12 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         inForeground = false;
+        if (root != null && isAppLocked()) {
+            root.removeCallbacks(lockRunnable);
+            if (lockCancel == null && !deviceUnlockPending) {
+                lockArmed = false;
+            }
+        }
     }
 
     /** 读取剪贴板时间戳(不读内容,不触发 Android 12+ 系统提示);拿不到时返回 -1 */
@@ -325,13 +384,18 @@ public class MainActivity extends Activity {
 
         // 长按图标的动态快捷方式:直达指定历史会话
         if (intent != null && ACTION_OPEN_SESSION.equals(intent.getAction())) {
-            String target = intent.getStringExtra(KEY_URL);
-            if (target != null && REMOTE_URL.matcher(target).find()) {
-                prefs.edit().putString(KEY_URL, target).apply();
-                recordHistory(target);
-                showWeb(target);
-                return;
+            String id = intent.getStringExtra(KEY_SHORTCUT_ID);
+            for (HistoryItem item : getHistoryList()) {
+                if (id != null && id.equals(shortcutId(item.url))) {
+                    prefs.edit().putString(KEY_URL, item.url).apply();
+                    recordHistory(item.url);
+                    showWeb(item.url);
+                    return;
+                }
             }
+            toast("这台电脑已从列表移除,请重新添加快捷方式");
+            showHistoryDialog();
+            return;
         }
 
         // 在其他 App(微信/QQ/短信)里点击或分享远程链接,直接用本 App 打开
@@ -359,21 +423,14 @@ public class MainActivity extends Activity {
             }
         }
 
-        if (switchToClipboardUrl()) {
-            if (launchScan) {
-                startScan();
-            }
+        if (!isExplicitRoute(intent) && switchToClipboardUrl()) {
             return;
         }
 
         String saved = prefs.getString(KEY_URL, null);
         if (saved != null) {
-            if (!saved.equals(loadedUrl)) {
+            if (!saved.equals(loadedUrl) || overlayView != null) {
                 showWeb(saved);
-            } else if (overlayView != null) {
-                // 同一链接的 onNewIntent:回到会话层即可,不重载
-                removeOverlay();
-                onErrorPage = false;
             }
         } else {
             showSetup(null, null);
@@ -493,6 +550,20 @@ public class MainActivity extends Activity {
         return deriveName(url);
     }
 
+    private String shortcutId(String url) {
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256").digest(url.getBytes(StandardCharsets.UTF_8));
+            StringBuilder id = new StringBuilder("computer_");
+            for (int i = 0; i < 16; i++) {
+                id.append(Character.forDigit((hash[i] >> 4) & 15, 16));
+                id.append(Character.forDigit(hash[i] & 15, 16));
+            }
+            return id.toString();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     /** 记录一次使用:已有记录保留其名字与置顶状态(不覆盖用户设置),新记录自动派生名字 */
     private void recordHistory(String url) {
         if (url == null || url.trim().isEmpty()) {
@@ -554,8 +625,12 @@ public class MainActivity extends Activity {
     }
 
     private void clearHistory() {
+        List<HistoryItem> old = getHistoryList();
         getPreferences(Context.MODE_PRIVATE).edit().remove(KEY_HISTORY).apply();
         updateDynamicShortcuts();
+        for (HistoryItem item : old) {
+            disableComputerShortcut(item.url);
+        }
     }
 
     /** 删除单台电脑的记录;若删的是当前会话,不改变当前加载,仅从列表移除 */
@@ -567,6 +642,20 @@ public class MainActivity extends Activity {
             }
         }
         saveHistory(updated);
+        disableComputerShortcut(url);
+    }
+
+    private void disableComputerShortcut(String url) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            try {
+                ShortcutManager sm = getSystemService(ShortcutManager.class);
+                if (sm != null) {
+                    sm.disableShortcuts(java.util.Collections.singletonList(shortcutId(url)),
+                            "这台电脑已从列表移除");
+                }
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     private String formatRelativeTime(long time) {
@@ -616,7 +705,7 @@ public class MainActivity extends Activity {
         box.setPadding(pad, pad, pad, pad);
 
         TextView head = new TextView(this);
-        head.setText("点一下切换控制哪台电脑,长按可重命名(最多保存 " + MAX_HISTORY + " 台)");
+        head.setText("点电脑切换,点右侧操作可置顶、改名或删除(最多 " + MAX_HISTORY + " 台)");
         head.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         head.setTextColor(FG_DIM);
         head.setPadding(0, 0, 0, dp(12));
@@ -627,8 +716,9 @@ public class MainActivity extends Activity {
         for (final HistoryItem item : list) {
             final boolean isCurrent = item.url.equals(current);
             LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.VERTICAL);
-            row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(12), dp(10), dp(8), dp(10));
             row.setClickable(true);
             row.setFocusable(true);
 
@@ -644,21 +734,39 @@ public class MainActivity extends Activity {
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             rowLp.bottomMargin = dp(8);
 
+            LinearLayout details = new LinearLayout(this);
+            details.setOrientation(LinearLayout.VERTICAL);
+            details.setPadding(0, 0, dp(6), 0);
             // 电脑名为主标题——切换时认名字比认 URL 快得多
             TextView titleView = new TextView(this);
             titleView.setText((item.pinned ? "📌 " : "") + (isCurrent ? "● " : "") + safeName(item));
             titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
             titleView.setTextColor(isCurrent ? ACCENT : FG);
-            row.addView(titleView);
+            titleView.setSingleLine(true);
+            titleView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            details.addView(titleView);
 
             TextView metaView = new TextView(this);
-            metaView.setText(shortUrlId(item.url) + "  ·  " + formatRelativeTime(item.time)
-                    + (isCurrent ? "  ·  当前" : ""));
+            metaView.setText(formatRelativeTime(item.time) + (isCurrent ? "  ·  当前" : ""));
             metaView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             metaView.setTextColor(FG_DIM);
             metaView.setSingleLine(true);
             metaView.setPadding(0, dp(4), 0, 0);
-            row.addView(metaView);
+            details.addView(metaView);
+            row.addView(details, new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+            row.setContentDescription("切换到" + safeName(item) + (isCurrent ? ",当前电脑" : ""));
+
+            TextView actions = new TextView(this);
+            actions.setText("操作");
+            actions.setTextColor(ACCENT);
+            actions.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            actions.setGravity(Gravity.CENTER);
+            actions.setMinWidth(dp(52));
+            actions.setMinHeight(dp(48));
+            actions.setContentDescription("管理" + safeName(item));
+            actions.setOnClickListener(v -> showComputerActions(item, dialogHolder));
+            row.addView(actions);
 
             row.setOnClickListener(v -> {
                 if (dialogHolder[0] != null) {
@@ -677,28 +785,8 @@ public class MainActivity extends Activity {
                 toast("正在切换到 " + safeName(item));
             });
 
-            // 长按:置顶 / 重命名 / 删除(仅影响本机记录,不动电脑那端)
             row.setOnLongClickListener(v -> {
-                String pinLabel = item.pinned ? "取消置顶" : "置顶（排在列表最前）";
-                new AlertDialog.Builder(this)
-                        .setTitle(safeName(item))
-                        .setItems(new String[]{pinLabel, "重命名", "删除这台电脑的记录"},
-                                (d, which) -> {
-                                    if (which == 0) {
-                                        boolean newPinned = !item.pinned;
-                                        setSessionPinned(item.url, newPinned);
-                                        if (dialogHolder[0] != null) {
-                                            dialogHolder[0].dismiss();
-                                        }
-                                        toast(newPinned ? "已置顶「" + safeName(item) + "」" : "已取消置顶");
-                                        showHistoryDialog();
-                                    } else if (which == 1) {
-                                        showRenameDialog(item, dialogHolder);
-                                    } else {
-                                        confirmRemoveSession(item, dialogHolder);
-                                    }
-                                })
-                        .show();
+                showComputerActions(item, dialogHolder);
                 return true;
             });
 
@@ -721,6 +809,29 @@ public class MainActivity extends Activity {
                         })
                         .setNegativeButton("取消", null)
                         .show())
+                .show();
+    }
+
+    private void showComputerActions(HistoryItem item, AlertDialog[] holder) {
+        String pinLabel = item.pinned ? "取消置顶" : "置顶（排在列表最前）";
+        new AlertDialog.Builder(this)
+                .setTitle(safeName(item))
+                .setItems(new String[]{pinLabel, "重命名", "删除这台电脑的记录"},
+                        (d, which) -> {
+                            if (which == 0) {
+                                boolean pinned = !item.pinned;
+                                setSessionPinned(item.url, pinned);
+                                if (holder[0] != null) {
+                                    holder[0].dismiss();
+                                }
+                                toast(pinned ? "已置顶「" + safeName(item) + "」" : "已取消置顶");
+                                showHistoryDialog();
+                            } else if (which == 1) {
+                                showRenameDialog(item, holder);
+                            } else {
+                                confirmRemoveSession(item, holder);
+                            }
+                        })
                 .show();
     }
 
@@ -1291,7 +1402,7 @@ public class MainActivity extends Activity {
         box.addView(panelSwitch("启动时自动检查更新", "打开 App 时在后台静默检查", Updater.KEY_AUTO_UPDATE, (c) -> {
         }));
         // 应用锁默认关;开启即视为本次进程已验证,不立刻弹验证框
-        box.addView(panelSwitch("应用锁(指纹/人脸)", "打开 App 时需生物识别验证,防止他人借用会话", KEY_APP_LOCK, false, (c) -> {
+        box.addView(panelSwitch("应用锁(生物识别/屏幕锁)", "冷启动时验证后才能打开电脑会话", KEY_APP_LOCK, false, (c) -> {
             if (c) {
                 unlockedThisSession = true;
                 Toast.makeText(this, "已开启:下次冷启动 App 时需要验证", Toast.LENGTH_SHORT).show();
@@ -1519,6 +1630,17 @@ public class MainActivity extends Activity {
         Switch sw = new Switch(this);
         sw.setChecked(getPreferences(Context.MODE_PRIVATE).getBoolean(prefKey, def));
         sw.setOnCheckedChangeListener((v, c) -> {
+            if (KEY_APP_LOCK.equals(prefKey) && c && !canUseLockMethod()) {
+                sw.setChecked(false);
+                new AlertDialog.Builder(this)
+                        .setTitle("先设置设备解锁方式")
+                        .setMessage("应用锁需要设备屏幕锁或已录入的指纹/人脸。设置完成后再开启。")
+                        .setPositiveButton("去设置", (d, w) ->
+                                startActivity(new Intent(Settings.ACTION_SECURITY_SETTINGS)))
+                        .setNegativeButton("取消", null)
+                        .show();
+                return;
+            }
             getPreferences(Context.MODE_PRIVATE).edit().putBoolean(prefKey, c).apply();
             onChanged.onChanged(c);
         });
@@ -1822,75 +1944,171 @@ public class MainActivity extends Activity {
         return m.find() ? m.group() : null;
     }
 
-    /** 应用锁:开启后每次冷启动(进程新建)首次回前台要求生物识别验证,进程存活期间不重复验 */
-    private void maybeArmAppLock() {
-        if (unlockedThisSession || lockArmed
-                || !getPreferences(Context.MODE_PRIVATE).getBoolean(KEY_APP_LOCK, false)) {
+    private boolean canUseLockMethod() {
+        KeyguardManager keyguard = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        if (keyguard != null && keyguard.isDeviceSecure()) {
+            return true;
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            BiometricManager bm = getSystemService(BiometricManager.class);
+            return bm != null && bm.canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS;
+        }
+        if (Build.VERSION.SDK_INT == 28) {
+            android.hardware.fingerprint.FingerprintManager fm =
+                    (android.hardware.fingerprint.FingerprintManager) getSystemService(FINGERPRINT_SERVICE);
+            return fm != null && fm.isHardwareDetected() && fm.hasEnrolledFingerprints();
+        }
+        return false;
+    }
+
+    private void showLockCover() {
+        if (lockCover != null) {
             return;
         }
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        LinearLayout cover = new LinearLayout(this);
+        cover.setOrientation(LinearLayout.VERTICAL);
+        cover.setGravity(Gravity.CENTER);
+        cover.setPadding(dp(28), dp(24), dp(28), dp(24));
+        cover.setBackgroundColor(BG);
+        cover.setClickable(true);
+        cover.setFocusable(true);
+        TextView title = new TextView(this);
+        title.setText("会话已锁定");
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        title.setTextColor(FG);
+        title.setGravity(Gravity.CENTER);
+        cover.addView(title);
+        TextView hint = new TextView(this);
+        hint.setText("验证身份后才能打开电脑会话。未录入指纹或人脸时,可使用设备屏幕锁验证。");
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        hint.setTextColor(FG_DIM);
+        hint.setGravity(Gravity.CENTER);
+        hint.setPadding(0, dp(14), 0, dp(20));
+        cover.addView(hint);
+        Button retry = new Button(this);
+        retry.setText("重新验证");
+        retry.setOnClickListener(v -> {
+            if (!lockArmed) {
+                lockRetryRequired = false;
+                lockArmed = true;
+                showLock();
+            }
+        });
+        cover.addView(retry);
+        Button credential = new Button(this);
+        credential.setText("使用屏幕锁");
+        credential.setOnClickListener(v -> {
+            if (!lockArmed) {
+                lockRetryRequired = false;
+                lockArmed = true;
+                if (!startDeviceCredential()) {
+                    lockArmed = false;
+                    lockRetryRequired = true;
+                    toast("设备未设置屏幕锁");
+                }
+            }
+        });
+        cover.addView(credential);
+        Button settings = new Button(this);
+        settings.setText("设置屏幕锁");
+        settings.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_SECURITY_SETTINGS)));
+        cover.addView(settings);
+        Button exit = new Button(this);
+        exit.setText("退出应用");
+        exit.setOnClickListener(v -> finish());
+        cover.addView(exit);
+        lockCover = cover;
+        root.addView(cover, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    /** 冷启动时先盖住窗口、暂缓加载会话与更新弹窗,认证后只放行一次。 */
+    private void maybeArmAppLock() {
+        if (!isAppLocked() || lockArmed || lockRetryRequired || root == null || !inForeground) {
+            return;
+        }
+        showLockCover();
         lockArmed = true;
-        // 稍作延迟等窗口 focus 就绪,BiometricPrompt 在 resume 瞬间弹出更稳
         root.postDelayed(lockRunnable, 300);
     }
 
+    private void unlockApp() {
+        if (!isAppLocked()) {
+            return;
+        }
+        unlockedThisSession = true;
+        lockArmed = false;
+        lockRetryRequired = false;
+        lockCancel = null;
+        deviceUnlockPending = false;
+        if (lockCover != null) {
+            root.removeView(lockCover);
+            lockCover = null;
+        }
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        Intent intent = deferredIntent;
+        deferredIntent = null;
+        finishStartup(intent);
+    }
+
+    private boolean startDeviceCredential() {
+        KeyguardManager keyguard = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        Intent confirm = keyguard == null ? null : keyguard.createConfirmDeviceCredentialIntent(
+                "验证以打开 ZCode Remote", "会话链接可控制你的电脑");
+        if (confirm == null) {
+            return false;
+        }
+        try {
+            deviceUnlockPending = true;
+            startActivityForResult(confirm, REQ_DEVICE_UNLOCK);
+            return true;
+        } catch (Exception e) {
+            deviceUnlockPending = false;
+            return false;
+        }
+    }
+
     private void showLock() {
-        if (isFinishing() || isDestroyed()) {
+        if (isFinishing() || isDestroyed() || !isAppLocked() || !inForeground) {
             lockArmed = false;
             return;
         }
-        if (Build.VERSION.SDK_INT < 28) {
-            // 框架版 BiometricPrompt API 28+;minSdk 26 的两档老系统直接放行(功能降级,不锁死用户)
-            lockArmed = false;
-            return;
-        }
-        // 注意:BiometricManager 是 API 29 才加入的类(API 28 只有 BiometricPrompt),
-        // 在 Android 9 上直接引用会 NoClassDefFoundError(Error 不是 Exception,catch 兜不住)——
-        // 28 用同能力的 FingerprintManager 做预检
-        boolean canVerify;
+        boolean canVerify = false;
         if (Build.VERSION.SDK_INT >= 29) {
             BiometricManager bm = getSystemService(BiometricManager.class);
             canVerify = bm != null && bm.canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS;
-        } else {
+        } else if (Build.VERSION.SDK_INT == 28) {
             android.hardware.fingerprint.FingerprintManager fm =
                     (android.hardware.fingerprint.FingerprintManager) getSystemService(FINGERPRINT_SERVICE);
             canVerify = fm != null && fm.isHardwareDetected() && fm.hasEnrolledFingerprints();
         }
         if (!canVerify) {
-            // 没录指纹/人脸或硬件不可用:弹窗说明并给"跳过",避免把自己锁在门外
-            lockArmed = false;
-            new AlertDialog.Builder(this)
-                    .setTitle("应用锁无法验证")
-                    .setMessage("设备未录入可用的指纹/人脸,本次跳过验证。\n\n请在系统设置中录入生物识别,或在菜单里关闭应用锁。")
-                    .setPositiveButton("知道了", null)
-                    .show();
+            if (!startDeviceCredential()) {
+                lockArmed = false;
+                lockRetryRequired = true;
+                toast("请先设置设备屏幕锁,再点重新验证");
+            }
             return;
         }
         BiometricPrompt prompt = new BiometricPrompt.Builder(this)
                 .setTitle("验证以打开 ZCode Remote")
                 .setSubtitle("会话链接可控制你的电脑,请本人验证")
-                .setNegativeButton("跳过", getMainExecutor(), (d, w) -> {
-                    lockArmed = false;
-                    toast("已跳过本次验证");
-                })
+                .setNegativeButton("退出应用", getMainExecutor(), (d, w) -> finish())
                 .build();
         lockCancel = new CancellationSignal();
         prompt.authenticate(lockCancel, getMainExecutor(),
                 new BiometricPrompt.AuthenticationCallback() {
                     @Override
                     public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
-                        unlockedThisSession = true;
-                        lockArmed = false;
+                        unlockApp();
                     }
 
                     @Override
                     public void onAuthenticationError(int errorCode, CharSequence errString) {
-                        // 用户取消/锁屏等:保持 armed,下次回前台再验
+                        lockCancel = null;
                         lockArmed = false;
-                    }
-
-                    @Override
-                    public void onAuthenticationFailed() {
-                        // 单次比对失败,系统弹窗还在,允许继续尝试
+                        lockRetryRequired = true;
                     }
                 });
     }
@@ -1974,10 +2192,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    /**
-     * 动态快捷方式:长按图标直达最近两个会话(排在静态"更换链接/扫码绑定"之前)。
-     * sid 会随会话轮换,快捷方式跟历史列表同步刷新;API 26+ 才支持 pinned/dynamic shortcuts。
-     */
+    /** 动态快捷方式仅携带本机记录标识;完整链接保留在本应用私有数据里。 */
     private void updateDynamicShortcuts() {
         if (Build.VERSION.SDK_INT < 26) {
             return;
@@ -1991,17 +2206,30 @@ public class MainActivity extends Activity {
             List<HistoryItem> history = getHistoryList();
             for (int i = 0; i < history.size() && i < 2; i++) {
                 HistoryItem item = history.get(i);
-                list.add(new ShortcutInfo.Builder(this, "session_" + i)
+                list.add(new ShortcutInfo.Builder(this, shortcutId(item.url))
                         .setShortLabel(safeName(item))
                         .setLongLabel("切换到 " + safeName(item))
                         .setIcon(Icon.createWithResource(this, R.drawable.ic_launcher_foreground))
                         .setIntent(new Intent(this, MainActivity.class)
                                 .setAction(ACTION_OPEN_SESSION)
-                                .putExtra(KEY_URL, item.url)
+                                .putExtra(KEY_SHORTCUT_ID, shortcutId(item.url))
                                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP))
                         .build());
             }
             sm.setDynamicShortcuts(list);
+            if (!getPreferences(Context.MODE_PRIVATE).getBoolean("shortcuts_without_url", false)) {
+                List<String> legacy = new ArrayList<>();
+                for (ShortcutInfo shortcut : sm.getPinnedShortcuts()) {
+                    if ("session_0".equals(shortcut.getId()) || "session_1".equals(shortcut.getId())) {
+                        legacy.add(shortcut.getId());
+                    }
+                }
+                if (!legacy.isEmpty()) {
+                    sm.disableShortcuts(legacy, "旧快捷方式已失效,请重新添加");
+                }
+                getPreferences(Context.MODE_PRIVATE).edit()
+                        .putBoolean("shortcuts_without_url", true).apply();
+            }
         } catch (Exception ignored) {
             // 桌面启动器限流等场景会抛异常,快捷方式是锦上添花,失败不影响主流程
         }
@@ -2014,12 +2242,23 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_DEVICE_UNLOCK) {
+            deviceUnlockPending = false;
+            if (resultCode == RESULT_OK) {
+                unlockApp();
+            } else {
+                lockArmed = false;
+                lockRetryRequired = true;
+            }
+            return;
+        }
         if (requestCode == REQ_SCAN) {
             if (resultCode == RESULT_OK && data != null) {
                 String scanned = data.getStringExtra(ScanActivity.EXTRA_URL);
                 if (scanned != null) {
                     Matcher m = REMOTE_URL.matcher(scanned);
                     String url = m.find() ? m.group() : scanned.trim();
+                    lastClipTimestamp = clipboardTimestamp();
                     getPreferences(Context.MODE_PRIVATE).edit().putString(KEY_URL, url).apply();
                     recordHistory(url);
                     Toast.makeText(this, "扫码成功,正在打开会话", Toast.LENGTH_SHORT).show();
@@ -2087,6 +2326,9 @@ public class MainActivity extends Activity {
     }
 
     private boolean handleBack() {
+        if (isAppLocked()) {
+            return false;
+        }
         if (overlayView != null && !onErrorPage) {
             // 掀覆盖层统一收敛到 showWeb:同链未失败=秒回;上次加载失败=reload(只掀层会露出
             // 内核错误白页,且清掉 onErrorPage 后网络恢复自动重连也失效);首启没有任何会话层
