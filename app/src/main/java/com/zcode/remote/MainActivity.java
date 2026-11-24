@@ -35,7 +35,9 @@ import android.webkit.CookieManager;
 import android.webkit.PermissionRequest;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
+import android.webkit.WebBackForwardList;
 import android.webkit.WebChromeClient;
+import android.webkit.WebHistoryItem;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -90,6 +92,11 @@ public class MainActivity extends Activity {
     private static final String ACTION_OPEN_SESSION = "com.zcode.remote.OPEN_SESSION";
     private static final String KEY_SHORTCUT_ID = "computer_id";
     private static final Pattern REMOTE_URL = Pattern.compile("https://zcode\\.z\\.ai/remote\\S*");
+    // 桌面端 4.0.0 起远程页强制登录与电脑端相同的账号:网页靠"整页跳到第一方授权页 → 回调页换取令牌 →
+    // 跳回远程页"完成登录,回调页必须和发起登录的是同一个 WebView(待处理的登录记录在其 DOM storage 里,
+    // 等待页自己不轮询)。把这些域名当外链甩给系统浏览器,网页会永远停在 "Waiting for authorization"。
+    // 只放行第一方登录域名,聊天内容里的链接等其余外链仍跳系统浏览器;bigmodel.cn 含其子域
+    private static final String[] SIGNIN_HOSTS = {"zchat.z.ai", "chat.z.ai", "bigmodel.cn"};
     // 版本自动更新:GitHub Releases 元数据,tag 命名 v1.3,asset 为任意 .apk(逻辑在 Updater)
     static final String KEY_KEEP_SCREEN_ON = "keep_screen_on";
     private static final String KEY_HISTORY = "history_urls";
@@ -990,13 +997,55 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 会话域名及其子域:网页本体的资源都在这里,永远在 WebView 内加载 */
+    private boolean isSessionHost(String host) {
+        return host != null && allowedHost != null
+                && (host.equals(allowedHost) || host.endsWith("." + allowedHost));
+    }
+
+    /** 第一方登录域名:远程页的登录往返要在壳内完成,见 SIGNIN_HOSTS */
+    private static boolean isSigninHost(String host) {
+        if (host == null) {
+            return false;
+        }
+        for (String h : SIGNIN_HOSTS) {
+            if (host.equals(h) || host.endsWith("." + h)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** WebView 当前是否停在登录授权页(而不是会话页):按域名判断,不受会话页自身改写查询参数影响 */
+    private boolean onSigninPage() {
+        String current = webView == null ? null : webView.getUrl();
+        return current != null && isSigninHost(Uri.parse(current).getHost());
+    }
+
+    /**
+     * 返回键的目标:历史里最近一个不在登录授权页上的条目。登录往返留下的授权页已失效,退回去只会看到报错,
+     * 所以一步跨过它们。返回相对当前条目的偏移(负数=后退),没有可回条目返回 0
+     */
+    private int backStepSkippingSignin() {
+        WebBackForwardList list = webView.copyBackForwardList();
+        int cur = list.getCurrentIndex();
+        for (int i = cur - 1; i >= 0; i--) {
+            WebHistoryItem item = list.getItemAtIndex(i);
+            if (!isSigninHost(item == null ? null : Uri.parse(item.getUrl()).getHost())) {
+                return i - cur;
+            }
+        }
+        return 0;
+    }
+
     private void showWeb(String url) {
         onErrorPage = false;
         if (sessionView == null) {
             // 首次:构建并挂到 root(buildSessionView 内部完成 addView)
             buildSessionView(url);
-        } else if (!url.equals(loadedUrl)) {
-            // 同一 WebView 实例直接换链接:不重建,历史/扫码/剪贴板切会话都是秒切
+        } else if (!url.equals(loadedUrl) || onSigninPage()) {
+            // 同一 WebView 实例直接换链接:不重建,历史/扫码/剪贴板切会话都是秒切;
+            // WebView 停在登录授权页时也走这里:loadedUrl 没变但页面已不在会话上,必须导航回去
             loadedUrl = url;
             allowedHost = Uri.parse(url).getHost();
             webLoadFailed = false;
@@ -1040,7 +1089,12 @@ public class MainActivity extends Activity {
                 String scheme = uri.getScheme();
                 String host = uri.getHost();
                 if (("http".equals(scheme) || "https".equals(scheme)) && host != null
-                        && (host.equals(allowedHost) || host.endsWith("." + allowedHost))) {
+                        && (isSessionHost(host) || isSigninHost(host))) {
+                    return false;
+                }
+                // 子框架(iframe)不是页面跳转:交给 WebView 正常加载,甩出去只会在外部浏览器打开一个孤立的 iframe 地址
+                // (登录页的验证码等嵌入组件靠它)
+                if (!request.isForMainFrame()) {
                     return false;
                 }
                 openExternal(uri);
@@ -2344,9 +2398,12 @@ public class MainActivity extends Activity {
             }
             return true;
         }
-        if (!onErrorPage && webView != null && webView.canGoBack()) {
-            webView.goBack();
-            return true;
+        if (!onErrorPage && webView != null) {
+            int step = backStepSkippingSignin();
+            if (step < 0) {
+                webView.goBackOrForward(step);
+                return true;
+            }
         }
         long now = System.currentTimeMillis();
         if (now - lastBackTime < 2000L) {

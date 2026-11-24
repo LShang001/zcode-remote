@@ -14,7 +14,7 @@
 ```bash
 # 构建并发版(JDK 已装但不在 PATH,必须先 export)——发版产物用 release 变体(debuggable=false),
 # 签名沿用 debug keystore(老用户已装 debug 签名版本,换签名将无法覆盖安装)
-export JAVA_HOME="C:\\Program Files\\Microsoft\\jdk-17.0.20.8-hotspot"
+export JAVA_HOME="C:\\Program Files\\Microsoft\\jdk-17.0.20.101-hotspot"
 /c/Users/12631/.zcode/tools/gradle-8.9/bin/gradle.bat assembleRelease --console=plain
 cp -f app/build/outputs/apk/release/app-release.apk ZCodeRemote.apk
 ```
@@ -146,6 +146,8 @@ gh release create vX.Y /tmp/ZCodeRemote-vX.Y.apk --title "vX.Y" --notes "本版�
 - **DownloadManager 的 ACTION_DOWNLOAD_COMPLETE 广播包含 FAILED 条目**:收到匹配 id 不能直接 `scheduleVerify`,应先查询 `COLUMN_STATUS`:成功→延迟验签,失败→换源;否则失败下载抢在轮询前把 id 清零、跳过镜像兜底。重启恢复下载应连源下标/轮次一起恢复,避免失败后重走第一源(来源:2026-09-25 v2.14 代码审计)
 - **扫码相机与相册异步解码竞争时必须使旧结果失效**:开启系统选图前停预览并递增代数;相机结果回主线程时核对代数与 `galleryActive`,避免选择器打开后旧相机帧把用户选择抢走。Otsu 灰度累加/类间方差不可用 int,常规大图就会溢出(来源:2026-09-25 v2.14 代码审计)
 - **应用锁检查不能晚于会话路由**:即便 BiometricPrompt 延迟弹出只有 300ms,WebView 在提示前已加载,取消按钮若允许「跳过」则已存 sid 直接可用;冷启动先遮挡且暂缓 route/恢复更新,成功认证后再加载(来源:2026-09-25 v2.14 代码审计和模拟器验证)
+- **桌面端 4.0.0 起远程页要先登录、且登录往返必须在壳内完成,否则永远停在 "Sign In To Continue / Waiting for authorization"**:旧壳把 `allowedHost`(zcode.z.ai)以外的一切主框架导航都 `openExternal` 甩给系统浏览器,而新网页的登录是「整页跳到第一方授权域名 → 回调页换取令牌 → replace 回远程页」,回调页(`zcode.z.ai/remote/v4?...`,即 `redirect_uri`)必须和发起登录的是**同一个 WebView**——待处理的登录记录在其 DOM storage 里,等待页 `Mxr` 只调 `handleCallback`,自己**不轮询**,换到系统浏览器就等于换了个存储,壳内永远等不到授权结果。v2.15 修法:新增 `SIGNIN_HOSTS = {zchat.z.ai, chat.z.ai, bigmodel.cn}`(含子域)在 `shouldOverrideUrlLoading` 里与会话域名一起放行,其余外链照旧跳浏览器;同时子框架(`!request.isForMainFrame()`)不再外甩(否则登录页的嵌入组件会在外部浏览器打开孤立 iframe),`showWeb` 在 `onSigninPage()` 时也走 loadUrl(否则停在授权页点「返回会话」只掀覆盖层、页面不导航),返回键用 `backStepSkippingSignin()` 跨过已失效的授权页历史。复现/验证要点:未登录时壳内会出现登录卡片,点主按钮才发起跳转(默认文案 "Authorize in browser");判定看 logcat `START u0 {act=android.intent.action.VIEW ...}` 的发起 uid 是否为本 App(uid 10193 之类)与 `dumpsys window` 的 `mCurrentFocus`,别只看截图(来源:2026-11-24 v2.15 排查——桌面端 11-23 从 3.18.1 升级 4.0.0、网页同步换 4.0.0 后用户报"连不上";日志显示配对其实成功过,真正卡点是登录;模拟器实测修复前后对照)
+- **`.zcode/tools` 下 JDK 目录名会随升级变**(2026-11-24 实测已从 `jdk-17.0.20.8-hotspot` 变为 `jdk-17.0.20.101-hotspot`,AGENTS.md §命令 已同步)——构建报 `JAVA_HOME` 无效时先 `ls "/c/Program Files/Microsoft/"` 看实际目录,别照抄旧路径:桌面→手机方向的 RPC 帧走带确认的分片传输,发送端维护**未确认重放缓冲,上限 8MB、宽限 45 秒**,任一超限即整桥降级重建(`raw relay bridge degraded`,reasonCode `remote.rpcFrame.replayBufferExceeded` / `replayGraceExceeded`),手机端网页随即走自己的 recover 流程重连+全量重同步——表象就是"断线重连中"。壳里所有 reload 路径都是显式触发(菜单刷新/下拉刷新/错误页重试/网络恢复/渲染进程死亡/剪贴板新链接),没有任何定时重载,所以排查这类反馈先看桌面端日志而不是改壳。诊断入口:桌面端 `~/.zcode/v2/logs/YYYY-MM-DD.log`,grep `web-remote-control`(手机端上报的诊断也记在这里,`mobile diagnostic` 的 `recover-start`/`state-transition` 频率即重连频率);中继地址 `wss://zcode.z.ai/ws`(测试环境 `wss://zcode.chatglm.site/ws`),单条逻辑消息上限 16MB/64 分片,比 8MB 重放上限还大(来源:2026-09-29 排查,当日 00:00–00:53 内 73 次桥降级、手机 58 次 recover-start;09-27 存在 11 小时零降级的稳定会话,故非必现,与链路质量/传输内容大小相关)
 
 ## 知识沉淀协议
 
